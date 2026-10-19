@@ -1,0 +1,21 @@
+# ===== IAR EWARM 编译产物（不纳入版本库） =====
+EWARM/**/Exe/
+EWARM/**/Obj/
+EWARM/**/List/
+EWARM/**/settings/
+*.o
+*.obj
+*.hex
+*.out
+*.axf
+*.bin
+
+# ===== 常见构建/IDE 中间文件 =====
+*.dep
+*.pbi
+*.ninja
+
+# ===== 操作系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+*.swp
