@@ -71,8 +71,11 @@ extern volatile uint8_t  mic_tpl_valid;    /* V6.0.2 固定 1（chirp 参考就�
 
 uint8_t  mic_tdoa_tx_snap(uint32_t *seq, uint32_t *t_us);
 /* 屏幕用的一致快照：同一次临界区读取最近配对及最近 10 次差值。 */
+#define MIC_DISTANCE_UNAVAILABLE UINT32_MAX
+double   mic_tdoa_all_sample_variance_mm2(uint32_t *count);
 uint8_t  mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
-                               int32_t *dt, int32_t *hist, uint8_t cap,
+                               int32_t *dt, uint32_t *distance_mm,
+                              uint32_t *history_mm, uint8_t cap,
                                uint8_t *count, uint32_t *dj_us);
 void     mic_tdoa_rx(uint32_t seq, uint32_t t_us);
 

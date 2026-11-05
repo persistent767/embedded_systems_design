@@ -22,7 +22,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-extern double mic_tdoa_all_sample_variance_us2(uint32_t *count);
 
 
 /* 两块板共用布局；启动时 IP_ADDRESS 尚未初始化，角色在各自固件中固定。 */
@@ -32,11 +31,17 @@ extern double mic_tdoa_all_sample_variance_us2(uint32_t *count);
 static const int8_t disp_temp_c[5] = {-20, 0, 20, 40, 60};
 static const uint32_t disp_speed_mps_x1000[5] = {319180u, 331300u, 343420u, 355540u, 367660u};
 #define DISP_TEMP_COUNT 5u
-static uint8_t disp_temp_sel = 2u;
-static uint8_t disp_temp_menu = 0u;
-static uint8_t disp_auto_temp = 1u;
-static uint8_t disp_air_temp10(int32_t *value);
-static uint32_t disp_current_speed(void);
+typedef enum
+{
+  DISP_TEMP_CLOSED,
+  DISP_TEMP_MODE,
+  DISP_TEMP_PRESET
+} disp_temp_menu_t;
+
+static volatile uint8_t disp_temp_sel = 2u;
+static disp_temp_menu_t disp_temp_menu = DISP_TEMP_CLOSED;
+static volatile uint8_t disp_auto_temp = 1u;
+static uint32_t disp_temp_snapshot(int32_t *temperature10);
 
 #define TS_ADDR       0x70u  /* STM32F746G-DISCO FT5336, HAL 8-bit address */
 #define TS_TOUCH_REG  0x02u
@@ -235,76 +240,27 @@ void disp_init(void)
 }
 
 /* ---- 声程差换算和显示（选定温度的声速，旧→新） --------------------------- */
-static uint32_t disp_distance_mm(int32_t dt_us)
-{
-  uint32_t mag = (dt_us < 0) ? (uint32_t)(-(int64_t)dt_us) : (uint32_t)dt_us;
-
-  /* dt(µs) × 声速(m/s×1000) / 10^6 = 距离(mm)，结果按 1 mm 显示。 */
-  return (uint32_t)((((uint64_t)mag * disp_current_speed()) + 500000u) / 1000000u);
-}
-
-/* 整数平方根，按最近整数取整，避免为显示统计量引入浮点库。 */
-#if 0 /* Previous rolling-ten SD implementation retained for reference. */
-static uint32_t disp_isqrt_round(uint64_t value)
-{
-  uint64_t bit = (uint64_t)1u << 62;
-  uint64_t root = 0u;
-
-  while (bit > value) { bit >>= 2; }
-  while (bit != 0u)
-  {
-    if (value >= root + bit)
-    {
-      value -= root + bit;
-      root = (root >> 1) + bit;
-    }
-    else { root >>= 1; }
-    bit >>= 2;
-  }
-  if (value > root) { root++; }
-  return (uint32_t)root;
-}
-
-/* 最近 n 次距离的样本标准差，返回 0.01 cm 单位。 */
-extern double mic_tdoa_all_sample_variance_us2(uint32_t *count);
-static uint32_t disp_distance_sd_centi_cm(const int32_t *history, uint8_t n)
-{
-  uint64_t sum_mm = 0u, sum_sq_mm2 = 0u, numerator, denominator;
-  uint8_t i;
-
-  if (n < 2u) { return 0u; }
-  for (i = 0u; i < n; i++)
-  {
-    uint32_t mm = disp_distance_mm(history[i]);
-    sum_mm += mm;
-    sum_sq_mm2 += (uint64_t)mm * mm;
-  }
-  numerator = (uint64_t)n * sum_sq_mm2 - sum_mm * sum_mm;
-  denominator = (uint64_t)n * (n - 1u);
-  return disp_isqrt_round((numerator * 100u + denominator / 2u) / denominator);
-}
-
-#endif
 static void disp_temp_button(void)
 {
   char b[24];
-  if (disp_auto_temp != 0u)
-  {
-    int32_t t;
-    disp_fill(12, 3, 195, 32, C_GRID);
-    if (disp_air_temp10(&t))
-    {
-      unsigned mag = (unsigned)((t < 0) ? -t : t);
-      (void)snprintf(b,sizeof(b),"A%s%u.%uC %um/s",t<0?"-":"",mag/10u,mag%10u,(unsigned)((disp_current_speed()+500u)/1000u));
-    }
-    else { (void)snprintf(b,sizeof(b),"F%+dC %um/s",(int)disp_temp_c[disp_temp_sel],(unsigned)((disp_current_speed()+500u)/1000u)); }
-    (void)disp_str(22,10,b,C_TEXT,1);
-    return;
-  }
+  int32_t t = 0;
+  uint32_t speed = disp_temp_snapshot(&t);
+
   disp_fill(12, 3, 195, 32, C_GRID);
-  (void)snprintf(b, sizeof(b), "T%+dC %um/s", (int)disp_temp_c[disp_temp_sel],
-                 (unsigned)((disp_speed_mps_x1000[disp_temp_sel] + 500u) / 1000u));
-  (void)disp_str(28, 10, b, C_TEXT, 1);
+  if (speed == 0u)
+  {
+    (void)snprintf(b, sizeof(b), "AUTO WAIT");
+  }
+  else if (disp_auto_temp != 0u)
+  {
+    unsigned mag = (unsigned)((t < 0) ? -t : t);
+    (void)snprintf(b, sizeof(b), "AUTO %s%u.%uC", t < 0 ? "-" : "", mag / 10u, mag % 10u);
+  }
+  else
+  {
+    (void)snprintf(b, sizeof(b), "SET %+dC", (int)(t / 10));
+  }
+  (void)disp_str(22, 10, b, C_TEXT, 1);
 }
 
 static void disp_temp_option_rect(uint8_t i, int32_t *x0, int32_t *y0,
@@ -323,11 +279,19 @@ static void disp_temp_popup(void)
 
   disp_fill(45, 87, 435, 264, C_BG);
   disp_fill(51, 93, 429, 258, C_PANEL);
-  (void)disp_str(70, 105, "AIR TEMP", C_TEXT, 1);
-  disp_fill(210,99,320,128,C_GRID);
-  (void)disp_str(238,106,"AUTO",C_ACC,1);
+  (void)disp_str(70, 105, (disp_temp_menu == DISP_TEMP_MODE) ? "TEMP MODE" : "SET TEMP", C_TEXT, 1);
   disp_fill(345, 99, 414, 128, C_GRID);
   (void)disp_str(352, 106, "CLOSE", C_DIM, 1);
+  if (disp_temp_menu == DISP_TEMP_MODE)
+  {
+    disp_fill(70, 153, 235, 206, (disp_auto_temp != 0u) ? C_ACC : C_GRID);
+    disp_fill(245, 153, 410, 206, (disp_auto_temp == 0u) ? C_ACC : C_GRID);
+    (void)disp_str(98, 172, "DHT11 AUTO", (disp_auto_temp != 0u) ? C_BG : C_TEXT, 1);
+    (void)disp_str(284, 172, "SET TEMP", (disp_auto_temp == 0u) ? C_BG : C_TEXT, 1);
+    return;
+  }
+  disp_fill(245, 99, 320, 128, C_GRID);
+  (void)disp_str(260, 106, "BACK", C_TEXT, 1);
   for (i = 0u; i < DISP_TEMP_COUNT; i++)
   {
     int32_t x0, y0, x1, y1;
@@ -365,18 +329,38 @@ static void disp_touch_poll(void)
   y = (uint16_t)(((uint16_t)(p[1] & 0x0Fu) << 8) | p[2]);
   if ((x >= DISP_W) || (y >= DISP_H)) { return; }
 
-  if (disp_temp_menu == 0u)
+  if (disp_temp_menu == DISP_TEMP_CLOSED)
   {
     if ((x >= 12u) && (x <= 195u) && (y >= 3u) && (y <= 32u))
     {
-      disp_temp_menu = 1u;
+      disp_temp_menu = DISP_TEMP_MODE;
     }
     return;
   }
-  if ((x>=210u)&&(x<=320u)&&(y>=99u)&&(y<=128u)) {disp_auto_temp=1u; disp_temp_menu=0u; return;}
   if ((x >= 345u) && (x <= 414u) && (y >= 99u) && (y <= 128u))
   {
-    disp_temp_menu = 0u;
+    disp_temp_menu = DISP_TEMP_CLOSED;
+    return;
+  }
+  if (disp_temp_menu == DISP_TEMP_MODE)
+  {
+    if ((y >= 153u) && (y <= 206u))
+    {
+      if ((x >= 70u) && (x <= 235u))
+      {
+        disp_auto_temp = 1u;
+        disp_temp_menu = DISP_TEMP_CLOSED;
+      }
+      else if ((x >= 245u) && (x <= 410u))
+      {
+        disp_temp_menu = DISP_TEMP_PRESET;
+      }
+    }
+    return;
+  }
+  if ((x >= 245u) && (x <= 320u) && (y >= 99u) && (y <= 128u))
+  {
+    disp_temp_menu = DISP_TEMP_MODE;
     return;
   }
   for (i = 0u; i < DISP_TEMP_COUNT; i++)
@@ -386,9 +370,9 @@ static void disp_touch_poll(void)
     if (((int32_t)x >= x0) && ((int32_t)x <= x1) &&
         ((int32_t)y >= y0) && ((int32_t)y <= y1))
     {
-      disp_auto_temp=0u;
       disp_temp_sel = i;
-      disp_temp_menu = 0u;
+      disp_auto_temp = 0u;
+      disp_temp_menu = DISP_TEMP_CLOSED;
       break;
     }
   }
@@ -410,16 +394,21 @@ static void disp_arrow(int32_t x, int32_t y, int32_t dir)
 }
 
 /* 最近 10 次声程差，五列两行，左旧右新，保留 0.1 cm 读数。 */
-static void disp_history(const int32_t *v, uint8_t n)
+static void disp_history(const uint32_t *v, uint8_t n)
 {
   char b[20];
   uint8_t i;
 
   for (i = 0u; i < n; i++)
   {
-    uint32_t mm = disp_distance_mm(v[i]);
+    uint32_t mm = v[i];
     int32_t x = 20 + (int32_t)(i % 5u) * 90;
     int32_t y = 229 + (int32_t)(i / 5u) * 19;
+    if (mm == MIC_DISTANCE_UNAVAILABLE)
+    {
+      (void)disp_str(x, y, "--", C_DIM, 1);
+      continue;
+    }
     (void)snprintf(b, sizeof(b), "%lu.%lu", (unsigned long)(mm / 10u),
                    (unsigned long)(mm % 10u));
     (void)disp_str(x, y, b, (i == n - 1u) ? C_ACC : C_TEXT, 1);
@@ -464,24 +453,24 @@ static void disp_render(void)
   static uint32_t last_sd_pairs = 0u;
   static uint8_t last_temp_sel = 2u, last_temp_menu = 0u;
   static uint32_t last_lus = 0u, last_pus = 0u, last_dj = 0u, last_conv_ms = 0u;
-  static int32_t last_dt = 0, last_hist[10];
-  static uint32_t last_speed; static uint8_t last_auto=1u,last_air_valid;
+  static int32_t last_dt = 0;
+  static uint32_t last_hist[10];
+  static uint32_t last_speed;
+  static uint8_t last_auto = 1u;
   char     b[48];
   uint32_t lus = 0u, pus = 0u;
   uint32_t conv_ms = 0u;
   uint32_t master_us, slave_us;
   int32_t  dt = 0, master_minus_slave;
-  int32_t  hist[10];
+  uint32_t distance_mm = 0u, hist[10];
   uint8_t  tpl_ok = mic_tpl_valid;
   uint8_t  paired;
   uint8_t  nth = 0u;
   uint8_t  conv_ok, acoustic_changed, full_redraw;
   uint32_t dj_us = 0u;
-  int32_t air_t;
-  uint8_t air_valid=disp_air_temp10(&air_t);
-  uint32_t speed=disp_current_speed();
-  uint8_t air_changed=(uint8_t)((speed!=last_speed)||(disp_auto_temp!=last_auto)||(air_valid!=last_air_valid));
-  paired = mic_tdoa_display_snap(&lus, &pus, &dt, hist, 10u, &nth, &dj_us);
+  uint32_t speed = disp_measurement_speed_x1000();
+  uint8_t air_changed = (uint8_t)((speed != last_speed) || (disp_auto_temp != last_auto));
+  paired = mic_tdoa_display_snap(&lus, &pus, &dt, &distance_mm, hist, 10u, &nth, &dj_us);
 
   /* 没配对上时不显示任何结果，避免旧读数被当成验收数据。 */
   if (tpl_ok == 0u) { paired = 0u; }
@@ -535,10 +524,16 @@ static void disp_render(void)
 
   if (paired != 0u)
   {
-    uint32_t mm = disp_distance_mm(dt);
-    (void)snprintf(b, sizeof(b), "%lu.%lu", (unsigned long)(mm / 10u),
-                   (unsigned long)(mm % 10u));
-    (void)disp_str(313, 77, b, C_ACC, 2);
+    if (distance_mm == MIC_DISTANCE_UNAVAILABLE)
+    {
+      (void)disp_str(313, 77, "--", C_DIM, 2);
+    }
+    else
+    {
+      (void)snprintf(b, sizeof(b), "%lu.%lu", (unsigned long)(distance_mm / 10u),
+                     (unsigned long)(distance_mm % 10u));
+      (void)disp_str(313, 77, b, C_ACC, 2);
+    }
     if (master_minus_slave == 0)
     {
       (void)disp_str(108, 71, "CENTER", C_ACC, 1);
@@ -553,7 +548,7 @@ static void disp_render(void)
   else
   {
     (void)disp_str(313, 77, "--", C_DIM, 2);
-    (void)disp_str(91, 71, (tpl_ok != 0u) ? "WAIT PAIR" : "REF WAIT", C_WARN, 1);
+    (void)disp_str(91, 71, (tpl_ok == 0u) ? "REF WAIT" : ((speed == 0u) ? "WAIT TEMP" : "WAIT PAIR"), C_WARN, 1);
   }
 
   /* 三个固定位置的时间读数；差值统一定义为主板减从板。 */
@@ -576,7 +571,7 @@ static void disp_render(void)
     (void)disp_str(332, 177, "--", C_DIM, 1);
   }
 
-  /* 最近十次的声程差，左旧右新；SD 用同一批距离计算。 */
+  /* 最近十次的声程差，左旧右新；SD 使用上电后的累计距离。 */
   disp_fill(99, 209, 141, 228, C_PANEL);
   disp_fill(145, 209, 337, 228, C_PANEL);
   disp_fill(343, 209, 468, 228, C_PANEL);
@@ -586,12 +581,15 @@ static void disp_render(void)
   if (paired != 0u)
   {
     uint32_t all_count;
-    double variance = mic_tdoa_all_sample_variance_us2(&all_count);
+    double variance = mic_tdoa_all_sample_variance_mm2(&all_count);
     uint32_t sd = (all_count >= 2u) ?
-      (uint32_t)(sqrt(variance) * (double)disp_current_speed() / 100000.0 + 0.5) : 0u;
-    (void)snprintf(b, sizeof(b), "SD %lu.%02lucm",
-                   (unsigned long)(sd / 100u),
-                   (unsigned long)(sd % 100u));
+      (uint32_t)(sqrt(variance) * 10.0 + 0.5) : 0u;
+    if (all_count == 0u) { (void)snprintf(b, sizeof(b), "SD --"); }
+    else
+    {
+      (void)snprintf(b, sizeof(b), "SD %lu.%02lucm",
+                     (unsigned long)(sd / 100u), (unsigned long)(sd % 100u));
+    }
   }
   else { (void)snprintf(b, sizeof(b), "SD --"); }
   (void)disp_str(145, 211, b, C_ACC, 1);
@@ -603,7 +601,8 @@ static void disp_render(void)
   if (disp_temp_menu != 0u) { disp_temp_popup(); }
 
   drawn = 1u;
-  last_speed=speed; last_auto=disp_auto_temp; last_air_valid=air_valid;
+  last_speed = speed;
+  last_auto = disp_auto_temp;
   last_temp_sel = disp_temp_sel;
   last_temp_menu = disp_temp_menu;
   last_paired = paired;
@@ -620,19 +619,52 @@ static void disp_render(void)
 }
 
 #include "lt_dht11_pb4.h"
-static uint8_t disp_air_temp10(int32_t *value) {if(!dht_initialized || !dht_valid){return 0u;} *value=dht_calibrated_temp10(); return 1u;}
-static uint32_t disp_current_speed(void)
-{
-  int32_t t,product,delta;
-  if(disp_auto_temp && disp_air_temp10(&t)) {product=606*t; delta=product>=0?(product+5)/10:-((-product+5)/10); return (uint32_t)(331300+delta);}
-  return disp_speed_mps_x1000[disp_temp_sel];
-}
+/* Publish the sensor reading even when A is locally using a preset. */
 uint32_t disp_air_tx_snap(int32_t *t)
 {
-  uint32_t mask=__get_PRIMASK(),speed; __disable_irq();
-  if(!disp_auto_temp || !disp_air_temp10(t)){*t=(int32_t)disp_temp_c[disp_temp_sel]*10;}
-  speed=disp_current_speed(); __set_PRIMASK(mask); return speed;
+  uint32_t mask = __get_PRIMASK();
+  uint32_t speed = 0u;
+
+  __disable_irq();
+  if (dht_initialized && dht_valid)
+  {
+    int32_t product;
+    int32_t delta;
+    *t = dht_calibrated_temp10();
+    product = 606 * *t;
+    delta = (product >= 0) ? (product + 5) / 10 : -((-product + 5) / 10);
+    speed = (uint32_t)(331300 + delta);
+  }
+  __set_PRIMASK(mask);
+  return speed;
 }
+
+static uint32_t disp_temp_snapshot(int32_t *t)
+{
+  uint32_t mask = __get_PRIMASK();
+  uint32_t speed = 0u;
+
+  __disable_irq();
+  if (disp_auto_temp != 0u)
+  {
+    speed = disp_air_tx_snap(t);
+  }
+  else
+  {
+    uint8_t index = disp_temp_sel;
+    *t = (int32_t)disp_temp_c[index] * 10;
+    speed = disp_speed_mps_x1000[index];
+  }
+  __set_PRIMASK(mask);
+  return speed;
+}
+
+uint32_t disp_measurement_speed_x1000(void)
+{
+  int32_t temperature10;
+  return disp_temp_snapshot(&temperature10);
+}
+
 void disp_task(void *argument)
 {
   char b[] = "[DISP] task up, drawing data\r\n";

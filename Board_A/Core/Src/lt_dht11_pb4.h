@@ -6,8 +6,8 @@ static volatile uint8_t dht_phase, dht_active, dht_state, dht_bits, dht_error;
 static volatile uint8_t dht_bytes[5];
 static volatile uint16_t dht_edge;
 static volatile uint32_t dht_rx_started;
-static uint8_t dht_initialized, dht_valid;
-static int dht_temp10;
+static volatile uint8_t dht_initialized, dht_valid;
+static volatile int dht_temp10;
 /* Single-point calibration in tenths of a degree C; raw reading is retained. */
 #define DHT11_TEMP_OFFSET10 (5)
 static int dht_calibrated_temp10(void) { return dht_temp10 + DHT11_TEMP_OFFSET10; }
@@ -88,7 +88,14 @@ static void dht11_draw(void)
 {
   char text[24]; int temp10=dht_calibrated_temp10(); unsigned mag=(unsigned)((temp10<0)?-temp10:temp10);
   static const char *const errors[]={"Temp:WAIT","Temp:NO DEV","Temp:RX ERR","Temp:CRC","Temp:TIMING","Temp:TIMER","Temp:RANGE","Temp:LOW"};
-  if (disp_temp_menu) {return;}
+  if (disp_temp_menu != DISP_TEMP_CLOSED) {return;}
+  if (disp_auto_temp == 0u)
+  {
+    (void)snprintf(text, sizeof(text), "Used:%+dC", (int)disp_temp_c[disp_temp_sel]);
+    disp_fill(311,122,467,139,C_PANEL);
+    (void)disp_str(313,123,text,C_ACC,1);
+    return;
+  }
   if (dht_valid) {(void)snprintf(text,sizeof(text),"Temp:%s%u.%uC",temp10<0?"-":"",mag/10u,mag%10u);}
   else {(void)snprintf(text,sizeof(text),"%s",errors[dht_error<8u?dht_error:2u]);}
   disp_fill(311,122,467,139,C_PANEL); (void)disp_str(313,123,text,dht_valid?C_ACC:C_WARN,1);

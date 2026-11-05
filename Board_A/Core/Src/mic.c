@@ -19,6 +19,7 @@
   ******************************************************************************
   */
 #include "mic.h"
+#include "disp.h"
 #include "main.h"
 #include "tim.h"      /* lt_now_cnt() */
 #include "adc.h"      /* hadc3 */
@@ -120,6 +121,8 @@ static uint32_t mic_pend_half_id = 0xFFFFFFFFu;
 static uint32_t mic_pend_pk = 0u;           /* 只保留包络峰值，省去整段包络数组 */
 static uint16_t mic_pend_n   = 0u;           /* 已收集点数 */
 static uint32_t mic_pend_us  = 0u;           /* 触发窗口起点的粗时刻（µs） */
+/* Lock the selected speed at the candidate trigger. Zero means AUTO is waiting. */
+static uint32_t mic_pend_speed_x1000;
 static int32_t mic_pend_phase_start_us = 0;   /* 触发时的同步拨钟快照 */
 static uint32_t mic_pend_ms  = 0u;           /* 触发时刻（ms），用于 2s 超时 */
 static volatile uint8_t mic_active = 0u;     /* 1 = 正在跟踪一次声音 */
@@ -144,7 +147,7 @@ static volatile uint8_t mic_arr_done = 0u;   /* 1 = 本次事件的到达时刻�
    的 rq/ct 用于验证弱信号相关值和计算耗时。 */
 #define MIC_CHIRP_DECIM    4u                              /* 96 kHz -> 24 kHz */
 #define MIC_CHIRP_X_N      (MIC_PEND_LEN / MIC_CHIRP_DECIM) /* 最多 2016 点 */
-#define MIC_CHIRP_MIN_R    0.22f                           /* 2 m 远板候选 rq=266~296；需实测误检和 TDOA */
+#define MIC_CHIRP_MIN_R    0.26f                           /* 2 m 远板候选 rq=266~296；需实测误检和 TDOA */
 
 static float mic_chirp_x[MIC_CHIRP_X_N];   /* 抽取后的接收信号，已去直流 */
 static float mic_chirp_energy[MIC_CHIRP_X_N - MIC_CHIRP_REF_N + 1u];
@@ -517,6 +520,7 @@ static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out)
 
 static uint32_t mic_td_lseq[MIC_TDOA_RING];   /* 本板事件序号 */
 static uint32_t mic_td_lus [MIC_TDOA_RING];   /* 本板事件时刻（µs） */
+static uint32_t mic_td_lspeed[MIC_TDOA_RING];
 static uint8_t  mic_td_ln   = 0u;             /* 已填条目数（≤ RING） */
 static uint8_t  mic_td_lidx = 0u;             /* 下一个写入位置 */
 
@@ -528,6 +532,9 @@ static uint32_t mic_td_useq  = 0u;            /* 已配过对的对方序号（�
 static uint32_t mic_td_luseq = 0u;            /* 已用过的本板序号（防重复） */
 
 static uint32_t mic_td_stat[MIC_TDOA_STAT];   /* 最近 10 次 TDOA 的原始差值 */
+static uint32_t mic_td_distance_mm[MIC_TDOA_STAT];
+static uint32_t mic_distance_sd_count;
+static double mic_distance_sd_mean, mic_distance_sd_m2;
 static uint8_t  mic_td_sidx = 0u;             /* 下一个写入位置 */
 static uint8_t  mic_td_sn   = 0u;             /* 已填条目数 */
 /* All accepted pairs since boot; Welford avoids an unbounded sample buffer. */
@@ -560,7 +567,8 @@ static int32_t mic_td_corrected_us(uint32_t tl, uint32_t tp)
                        : (dt_raw + MIC_TDOA_CAL_US);
 }
 
-static void mic_td_commit(uint32_t lseq, uint32_t pseq, uint32_t tl, uint32_t tp)
+static void mic_td_commit(uint32_t lseq, uint32_t pseq, uint32_t tl, uint32_t tp,
+                          uint32_t speed_x1000)
 {
   uint32_t i, n, mx = 0u;
   int32_t  dt_us = mic_td_corrected_us(tl, tp);
@@ -579,6 +587,22 @@ static void mic_td_commit(uint32_t lseq, uint32_t pseq, uint32_t tl, uint32_t tp
     delta = x - mic_all_sd_mean;
     mic_all_sd_mean += delta / (double)mic_all_sd_count;
     mic_all_sd_m2 += delta * (x - mic_all_sd_mean);
+  }
+
+  mic_td_distance_mm[mic_td_sidx] = MIC_DISTANCE_UNAVAILABLE;
+  if (speed_x1000 != 0u)
+  {
+    uint32_t magnitude_us = (uint32_t)((dt_us < 0) ? -dt_us : dt_us);
+    uint64_t scaled = (uint64_t)magnitude_us * speed_x1000;
+    mic_td_distance_mm[mic_td_sidx] = (uint32_t)((scaled + 500000u) / 1000000u);
+    if (mic_distance_sd_count != UINT32_MAX)
+    {
+      double distance_mm = (double)scaled / 1000000.0;
+      double delta = distance_mm - mic_distance_sd_mean;
+      mic_distance_sd_count++;
+      mic_distance_sd_mean += delta / (double)mic_distance_sd_count;
+      mic_distance_sd_m2 += delta * (distance_mm - mic_distance_sd_mean);
+    }
   }
 
   mic_td_stat[mic_td_sidx] = (uint32_t)dt_us;
@@ -674,7 +698,8 @@ static uint8_t mic_td_stable(int32_t dt_us)
 }
 
 /* 试配一对：窗口内 + 差值不超过物理上限，才承认 */
-static uint8_t mic_td_try(uint32_t lseq, uint32_t tl, uint32_t pseq, uint32_t tp)
+static uint8_t mic_td_try(uint32_t lseq, uint32_t tl, uint32_t pseq, uint32_t tp,
+                         uint32_t speed_x1000)
 {
   uint32_t d = mic_td_absdiff(tl, tp);
 
@@ -695,7 +720,7 @@ static uint8_t mic_td_try(uint32_t lseq, uint32_t tl, uint32_t pseq, uint32_t tp
     return 0u;
   }
 
-  mic_td_commit(lseq, pseq, tl, tp);
+  mic_td_commit(lseq, pseq, tl, tp, speed_x1000);
   return 1u;
 }
 
@@ -706,13 +731,14 @@ static void mic_td_local(uint32_t seq, uint32_t t_us)
 
   mic_td_lseq[mic_td_lidx] = seq;
   mic_td_lus [mic_td_lidx] = t_us;
+  mic_td_lspeed[mic_td_lidx] = mic_pend_speed_x1000;
   mic_td_lidx = (uint8_t)((mic_td_lidx + 1u) % MIC_TDOA_RING);
   if (mic_td_ln < MIC_TDOA_RING) { mic_td_ln++; }
 
   /* 对方的报文先到了：这一拍把另一半补上 */
   if ((mic_td_pend != 0u) && (mic_td_pseq != mic_td_useq))
   {
-    (void)mic_td_try(seq, t_us, mic_td_pseq, mic_td_pus);
+    (void)mic_td_try(seq, t_us, mic_td_pseq, mic_td_pus, mic_pend_speed_x1000);
   }
   mic_td_pend = 0u;      /* 对方那一条只用一次，配不上就作废 */
 
@@ -751,8 +777,20 @@ double mic_tdoa_all_sample_variance_us2(uint32_t *count)
   return variance;
 }
 
+double mic_tdoa_all_sample_variance_mm2(uint32_t *count)
+{
+  double variance;
+  taskENTER_CRITICAL();
+  *count = mic_distance_sd_count;
+  variance = (mic_distance_sd_count >= 2u) ?
+             mic_distance_sd_m2 / (double)(mic_distance_sd_count - 1u) : 0.0;
+  taskEXIT_CRITICAL();
+  return variance;
+}
+
 uint8_t mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
-                              int32_t *dt, int32_t *hist, uint8_t cap,
+                              int32_t *dt, uint32_t *distance_mm,
+                              uint32_t *history_mm, uint8_t cap,
                               uint8_t *count, uint32_t *dj_us)
 {
   uint8_t i, n, paired;
@@ -767,11 +805,12 @@ uint8_t mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
     *local_us = mic_td_last_lus;
     *peer_us = mic_td_last_pus;
     *dt = mic_tdoa_us;
+    *distance_mm = mic_td_distance_mm[(mic_td_sidx + MIC_TDOA_STAT - 1u) % MIC_TDOA_STAT];
     *dj_us = mic_tdoa_dj_us;
     for (i = 0u; i < n; i++)
     {
       uint8_t k = (uint8_t)((mic_td_sidx + MIC_TDOA_STAT + i - n) % MIC_TDOA_STAT);
-      hist[i] = (int32_t)mic_td_stat[k];
+      history_mm[i] = mic_td_distance_mm[k];
     }
   }
   else
@@ -810,7 +849,7 @@ void mic_tdoa_rx(uint32_t seq, uint32_t t_us)
 
     if (best != 0xFFu)
     {
-      (void)mic_td_try(mic_td_lseq[best], mic_td_lus[best], seq, t_us);
+      (void)mic_td_try(mic_td_lseq[best], mic_td_lus[best], seq, t_us, mic_td_lspeed[best]);
       mic_td_pend = 0u;      /* 这条报文已经处理过，不再留给下一拍 */
     }
     else
@@ -957,7 +996,9 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
      如静默时 tg 增长，需根据 [MIC] 的 mx/nf/trg 再校准。 */
   trig = mic_nfar + 4;
   if (trig < (mic_npk + 2)) { trig = mic_npk + 2; }
-  if (trig < 6) { trig = 6; }
+  /* A 板曾实测静默包络约 5~8；下限从 12 试降到 10，
+     现场需确认静默时 tg 不会持续增长。 */
+  if (trig < 10) { trig = 10; }
   low = trig - 1;
   if (low < 3) { low = 3; }
   mic_last_trig = (uint32_t)trig;
@@ -1044,6 +1085,7 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
           mic_pend_us = (uint32_t)(us64 / 108);
           mic_pend_subcnt = (uint32_t)(us64 % 108);
           mic_pend_phase_start_us = epoch_phase;
+          mic_pend_speed_x1000 = disp_measurement_speed_x1000();
           mic_candidate_trig = (uint32_t)trig;
 
           mic_pend_ms    = now;

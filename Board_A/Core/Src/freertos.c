@@ -1328,9 +1328,19 @@ static void lt_tx_task(void *argument)
     /* Independent temperature/speed packet, existing message layout. */
     if ((lt_is_master != 0U) && (lt_conv_comm_up != 0U) && ((uint32_t)(HAL_GetTick()-air_sent_at)>=1000u))
     {
-      int32_t t; uint32_t speed=disp_air_tx_snap(&t); air_sent_at=HAL_GetTick();
-      memset(&m,0,sizeof(m)); m.type=5u; m.t1=speed; m.t2=0x41495231u; m.off_m=t;
-      (void)lwip_sendto(lt_sock,&m,sizeof(m),MSG_DONTWAIT,(struct sockaddr *)&lt_peer,sizeof(lt_peer));
+      int32_t t;
+      uint32_t speed = disp_air_tx_snap(&t);
+      air_sent_at = HAL_GetTick();
+      if (speed != 0u)
+      {
+        memset(&m, 0, sizeof(m));
+        m.type = 5u;
+        m.t1 = speed;
+        m.t2 = 0x41495231u;
+        m.off_m = t;
+        (void)lwip_sendto(lt_sock, &m, sizeof(m), MSG_DONTWAIT,
+                          (struct sockaddr *)&lt_peer, sizeof(lt_peer));
+      }
     }
     /* ---- 声音触发链路诊断行（只走串口） ----------------------------------
        事件 / 配对 / 溢出一有变化就补一行，配合 2 s 一次的 [MIC] 实时行，

@@ -23,4 +23,6 @@ void disp_task(void *argument);  /* 轮询快照，仅在显示数据变化时�
 uint8_t lt_conv_display_snap(uint32_t *announce_ms);
 
 uint8_t lt_air_display_snap(int32_t *temperature10, uint32_t *speed1000);
+/* Selected sound speed in 0.001 m/s, or 0 when AUTO has no valid DHT11 sample. */
+uint32_t disp_measurement_speed_x1000(void);
 #endif /* __DISP_H__ */
