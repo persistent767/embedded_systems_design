@@ -49,7 +49,7 @@
    这样收报文处的长度校验和"哪些类型算通信建立"的判断范围都不用改。
    DREQ 的 pad[0] 第 0 位用于告知主板：从板已完成频率预标定。
    TOA 的字段含义：seq = 本板事件序号，t1 = 该事件在本地时钟上的到达时刻（µs），
-   t2 = 0（V6.0 保留字段，不再区分判决路径），其余字段为 0。 */
+   t2 = 声音类型（1=Chirp，2=拍手），其余字段为 0。 */
 typedef struct
 {
   uint8_t  type;    /* 1=SYNC(主板->从板) 2=DREQ(从板->主板) 3=DRESP(主板->从板) */
@@ -1320,15 +1320,16 @@ static void lt_tx_task(void *argument)
     if (lt_conv_comm_up != 0U)
     {
       uint32_t s_ev = 0U, t_ev = 0U;
+      uint8_t kind_ev = MIC_EVENT_NONE;
 
-      if ((mic_tdoa_tx_snap(&s_ev, &t_ev) != 0U) && (s_ev != lt_toa_sent))
+      if ((mic_tdoa_tx_snap(&s_ev, &t_ev, &kind_ev) != 0U) && (s_ev != lt_toa_sent))
       {
         lt_toa_sent = s_ev;
         memset(&m, 0, sizeof(m));
         m.type = LT_MSG_TOA;
         m.seq  = s_ev;      /* 本板事件序号 */
         m.t1   = t_ev;      /* 该事件在本地时钟上的到达时刻（µs）*/
-        m.t2   = 0U;         /* V6.0 保留：不再区分判决路径 */
+        m.t2   = kind_ev;   /* 1=Chirp, 2=clap */
         (void)lwip_sendto(lt_sock, &m, sizeof(m), 0U,
                           (struct sockaddr *)&lt_peer, sizeof(lt_peer));
       }
@@ -1359,7 +1360,7 @@ static void lt_tx_task(void *argument)
         extern volatile int32_t mic_event_sync_offset_us;
         extern volatile uint8_t mic_event_sync_valid;
         s_dbg_ev = mic_event_seq;
-        lt_log("[EVT] ev %lu t %lu pk %lu rq %lu pos %lu ph0 %ld ph1 %ld raw %lu sc %ld sa %lu sok %u sn %lu\r\n",
+        lt_log("[EVT] ev %lu t %lu pk %lu rq %lu pos %lu ph0 %ld ph1 %ld raw %lu sc %ld sa %lu sok %u sn %lu kind %s\r\n",
                (unsigned long)mic_event_seq,
                (unsigned long)mic_event_t_us,
                (unsigned long)mic_last_pk,
@@ -1371,12 +1372,13 @@ static void lt_tx_task(void *argument)
                (long)mic_event_sync_offset_us,
                (unsigned long)mic_event_sync_age_ms,
                (unsigned)mic_event_sync_valid,
-               (unsigned long)mic_event_sync_samples);
+               (unsigned long)mic_event_sync_samples,
+               mic_event_kind == MIC_EVENT_CLAP ? "CLAP" : "CHIRP");
       }
       if (mic_tdoa_pairs != s_dbg_pr)
       {
         s_dbg_pr = mic_tdoa_pairs;
-        lt_log("[TDOA] pr %lu rx %lu tdoa %ld dj %lu | off %ld age %lu far %lu nomatch %lu jump %lu\r\n",
+        lt_log("[TDOA] pr %lu rx %lu tdoa %ld dj %lu | off %ld age %lu far %lu nomatch %lu jump %lu kind %s\r\n",
                (unsigned long)mic_tdoa_pairs,
                (unsigned long)mic_tdoa_rxn,
                (long)mic_tdoa_us,
@@ -1386,7 +1388,8 @@ static void lt_tx_task(void *argument)
                                (HAL_GetTick() - lt_conv_last_ms) : 0U),
                (unsigned long)mic_td_rej_far,
                 (unsigned long)mic_tdoa_nomatch,
-                (unsigned long)mic_td_rej_jump);
+                (unsigned long)mic_td_rej_jump,
+                mic_tdoa_kind == MIC_EVENT_CLAP ? "CLAP" : "CHIRP");
       }
       if (mic_overruns != s_dbg_ov)
       {
@@ -1674,7 +1677,7 @@ static void lt_rx_task(void *argument)
       /* 对方的声到达时刻：只喂给跨板 TDOA 的配对统计。
          这条分支不读写任何同步状态量（lt_off_ / lt_dly_ / lt_conv_ / lt_servo_ 开头的那些），
          所以加它不会影响第一步的时钟收敛。 */
-      mic_tdoa_rx(m.seq, m.t1);
+      mic_tdoa_rx(m.seq, m.t1, m.t2);
     }
     else
     {

@@ -497,13 +497,14 @@ static void disp_render(void)
   int32_t  dt = 0, master_minus_slave;
   uint32_t distance_mm = 0u, hist[10];
   uint8_t  tpl_ok = mic_tpl_valid;
-  uint8_t  paired;
+  uint8_t  paired, kind;
+  static uint8_t last_kind;
   uint8_t  nth = 0u;
   uint8_t  conv_ok, acoustic_changed, full_redraw;
   uint32_t dj_us = 0u;
   uint32_t speed = disp_measurement_speed_x1000();
   uint8_t air_changed = (uint8_t)((speed != last_speed) || (disp_auto_temp != last_auto));
-  paired = mic_tdoa_display_snap(&lus, &pus, &dt, &distance_mm, hist, 10u, &nth, &dj_us);
+  paired = mic_tdoa_display_snap(&lus, &pus, &dt, &distance_mm, hist, 10u, &nth, &dj_us, &kind);
 
   /* 没配对上时不显示任何结果，避免旧读数被当成验收数据。 */
   if (tpl_ok == 0u) { paired = 0u; }
@@ -512,7 +513,7 @@ static void disp_render(void)
 
   full_redraw = (uint8_t)((drawn == 0u) || (disp_temp_menu != last_temp_menu));
 
-  acoustic_changed = (uint8_t)((full_redraw != 0u) || (paired != last_paired) ||
+  acoustic_changed = (uint8_t)((full_redraw != 0u) || (paired != last_paired) || (kind != last_kind) ||
                                (tpl_ok != last_tpl_ok) || (nth != last_nth) ||
                                (lus != last_lus) || (pus != last_pus) ||
                                (dt != last_dt) || (dj_us != last_dj) ||
@@ -591,6 +592,9 @@ static void disp_render(void)
   disp_fill(75, 70, 202, 89, C_PANEL);
   disp_fill(52, 105, 249, 137, C_PANEL);
   disp_hline(52, 248, 121, C_GRID);
+  disp_fill(311, 49, 467, 69, C_PANEL);
+  (void)disp_str(313, 51, (kind == MIC_EVENT_CLAP) ? "CLAP cm" :
+                         (kind == MIC_EVENT_CHIRP) ? "CHIRP cm" : "PATH DIFF cm", C_DIM, 1);
   disp_fill(311, 76, 467, 113, C_PANEL);
 
   if (paired != 0u)
@@ -652,7 +656,7 @@ static void disp_render(void)
   if (paired != 0u)
   {
     uint32_t all_count;
-    double variance = mic_tdoa_all_sample_variance_mm2(&all_count);
+    double variance = mic_tdoa_all_sample_variance_mm2(kind, &all_count);
     uint32_t sd = (all_count >= 2u) ?
       (uint32_t)(sqrt(variance) * 10.0 + 0.5) : 0u;
     if (all_count == 0u) { (void)snprintf(b, sizeof(b), "SD --"); }
@@ -677,6 +681,7 @@ static void disp_render(void)
   last_temp_sel = disp_temp_sel;
   last_temp_menu = disp_temp_menu;
   last_paired = paired;
+  last_kind = kind;
   last_tpl_ok = tpl_ok;
   last_nth = nth;
   last_sd_pairs = mic_tdoa_pairs;

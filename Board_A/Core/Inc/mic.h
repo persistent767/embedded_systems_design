@@ -14,6 +14,13 @@ extern "C" {
 
 #include <stdint.h>
 
+#define MIC_EVENT_NONE  0u
+#define MIC_EVENT_CHIRP 1u
+#define MIC_EVENT_CLAP  2u
+
+extern volatile uint8_t mic_event_kind;
+extern volatile uint8_t mic_tdoa_kind;
+
 /* ---- 采样参数 -------------------------------------------------------------- */
 #define MIC_FS_HZ        96000u      /* 采样率：TIM2 = 108MHz/1125 */
 #define MIC_CNT_PER_SMP  1125u       /* 每个采样点 = 1125 个 TIM 计数，整数、无舍入 */
@@ -71,15 +78,15 @@ extern volatile uint32_t mic_td_rej_jump;  /* 配对相对稳定位置跳变、�
 extern volatile uint32_t mic_tdoa_nomatch; /* 收报文但本板窗口内无事件可配的次数 */
 extern volatile uint8_t  mic_tpl_valid;    /* V6.0.2 固定 1（chirp 参考就绪） */
 
-uint8_t  mic_tdoa_tx_snap(uint32_t *seq, uint32_t *t_us);
+uint8_t  mic_tdoa_tx_snap(uint32_t *seq, uint32_t *t_us, uint8_t *kind);
 /* 屏幕用的一致快照：同一次临界区读取最近配对及最近 10 次差值。 */
 #define MIC_DISTANCE_UNAVAILABLE UINT32_MAX
-double   mic_tdoa_all_sample_variance_mm2(uint32_t *count);
+double   mic_tdoa_all_sample_variance_mm2(uint8_t kind, uint32_t *count);
 uint8_t  mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
                                int32_t *dt, uint32_t *distance_mm,
                               uint32_t *history_mm, uint8_t cap,
-                               uint8_t *count, uint32_t *dj_us);
-void     mic_tdoa_rx(uint32_t seq, uint32_t t_us);
+                               uint8_t *count, uint32_t *dj_us, uint8_t *kind);
+void     mic_tdoa_rx(uint32_t seq, uint32_t t_us, uint32_t kind);
 
 /* 链路诊断 */
 extern volatile uint32_t mic_overruns;     /* 任务没赶上、被 DMA 覆盖的半缓冲数 */
