@@ -74,7 +74,7 @@ void lt_boot_mark(void);   /* freertos.c：上电计时打点，见 CONVERGED �
   * @brief  The application entry point.
   * @retval int
   */
-- int main(void)
+int main(void)
 {
 
   /* USER CODE BEGIN 1 */
