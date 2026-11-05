@@ -1,0 +1,19 @@
+# IAR build output and local workspace state
+**/EWARM/**/Exe/
+**/EWARM/**/Obj/
+**/EWARM/**/List/
+**/EWARM/settings/
+*.dep
+*.pbi
+*.hex
+*.out
+*.axf
+*.o
+*.obj
+*.bak
+*.before_*
+Thumbs.db
+.DS_Store
+
+/Board_A/EWARM/LT_KeShe/
+/Board_B/EWARM/LT_KeShe_B/
