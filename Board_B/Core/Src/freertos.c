@@ -272,6 +272,12 @@ static const osThreadAttr_t mic_attr = {
 
 /* 显示任务：20fps 刷屏，优先级放在 micTask 之下——画屏只是"看"，不能影响
    采样处理与以太网接收。 */
+static const osThreadAttr_t mic_analysis_attr = {
+  .name = "micAnalysis",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t)osPriorityLow1,
+};
+
 static const osThreadAttr_t disp_attr = {
   .name = "dispTask",
   .stack_size = 512 * 4,
@@ -348,11 +354,13 @@ void MX_FREERTOS_Init(void) {
   {
     /* 麦克风采样处理任务（mic.c）与显示任务（disp.c）。
        把创建结果和剩余堆打出来：若显示任务创建失败，屏幕会停在开机那一帧。 */
-    osThreadId_t h_mic = osThreadNew(mic_task, NULL, &mic_attr);
+    osThreadId_t h_analysis = osThreadNew(mic_analysis_task, NULL, &mic_analysis_attr);
+    osThreadId_t h_mic = (h_analysis != NULL) ? osThreadNew(mic_task, h_analysis, &mic_attr) : NULL;
     osThreadId_t h_dsp = osThreadNew(disp_task, NULL, &disp_attr);
 
-    lt_log("[RTOS] mic %s  disp %s  heap %lu\r\n",
+    lt_log("[RTOS] mic %s  analysis %s  disp %s  heap %lu\r\n",
            (h_mic != NULL) ? "ok" : "FAIL",
+           (h_analysis != NULL) ? "ok" : "FAIL",
            (h_dsp != NULL) ? "ok" : "FAIL",
            (unsigned long)xPortGetFreeHeapSize());
   }
@@ -1462,7 +1470,11 @@ static void lt_tx_task(void *argument)
          learn 学模板次数 / rx 收到对板 TOA 报文数 / pr 配对成功次数 /
          ov 丢半缓冲次数；rq 为上次相关峰值，sh/rej 分别是窗口过短/相关不足，
          ct 为上次匹配计算耗时。 */
-       lt_log("[MIC] tg %lu ev %lu mx %lu pp %ld nf %lu trg %lu tpl %u learn %lu rx %lu pr %lu ov %lu rq %lu sh %lu rej %lu ct %lu jr %lu\r\n",
+      lt_log("[PEER] attempts %lu history_gap %lu accepted %lu far %lu\r\n",
+             (unsigned long)mic_peer_attempt_cnt, (unsigned long)mic_peer_gap_cnt,
+             (unsigned long)mic_weak_chirp_cnt,
+             (unsigned long)mic_td_rej_far);
+       lt_log("[MIC] tg %lu ev %lu mx %lu pp %ld nf %lu trg %lu tpl %u learn %lu rx %lu pr %lu ov %lu rq %lu sh %lu rej %lu ct %lu jr %lu wk %lu\r\n",
              (unsigned long)mic_trig_cnt,
              (unsigned long)mic_event_seq,
              (unsigned long)mic_env_mx_live,
@@ -1478,7 +1490,8 @@ static void lt_tx_task(void *argument)
              (unsigned long)mic_match_short_cnt,
              (unsigned long)mic_match_reject_cnt,
               (unsigned long)mic_match_cost_us,
-              (unsigned long)mic_td_rej_jump);
+              (unsigned long)mic_td_rej_jump,
+             (unsigned long)mic_weak_chirp_cnt);
       lt_log("[LT] RAW seq %lu t1 %lu t2 %lu t3 %lu t4 %lu | frames %lu msgs %lu | reg %lu/%lu\r\n",
              (unsigned long)lt_dbg_seq,
              (unsigned long)lt_dbg_t1,

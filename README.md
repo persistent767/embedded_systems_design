@@ -4,8 +4,8 @@
 
 | 工程 | 角色 | 默认 IP | IAR 工作区 |
 | --- | --- | --- | --- |
-| [Board_A](Board_A/) | 主板、近板、同步基准，采集 DHT11 温度并向 B 板发送温度和声速 | `192.168.1.10` | [Board_A/EWARM/Project.eww](Board_A/EWARM/Project.eww) |
-| [Board_B](Board_B/) | 从板、远板，根据同步结果修正时钟，接收 A 板温度和声速 | `192.168.1.11` | [Board_B/EWARM/Project.eww](Board_B/EWARM/Project.eww) |
+| [Board_A](Board_A/) | 主板、同步基准，采集 DHT11 温度并向 B 板发送温度和声速 | `192.168.1.10` | [Board_A/EWARM/Project.eww](Board_A/EWARM/Project.eww) |
+| [Board_B](Board_B/) | 从板，根据同步结果修正时钟，接收 A 板温度和声速 | `192.168.1.11` | [Board_B/EWARM/Project.eww](Board_B/EWARM/Project.eww) |
 
 ## 编译和连接
 
@@ -18,15 +18,19 @@
 
 | 参数 | A 板 | B 板 | 作用 |
 | --- | --- | --- | --- |
-| `MIC_CHIRP_MIN_R` | `0.26f` | `0.26f` | chirp 模板的归一化相关门限 |
-| 包络触发下限 | 10 个 ADC 码 | 6 个 ADC 码 | 自适应触发门限的最低值 |
+| `MIC_CHIRP_MIN_R` | `0.22f` | `0.22f` | 本地 chirp 识别的归一化相关门限 |
+| `MIC_CHIRP_PEER_MIN_R` | `0.13f` | `0.13f` | 对端报文引导回查时的相关门限 |
+| `MIC_TDOA_VALID_US` | `7353 µs` | `7353 µs` | 两板到达时刻允许的最大绝对差 |
+| 包络触发下限 | 16 个 ADC 码 | 9 个 ADC 码 | 自适应触发门限的最低值 |
 | `MIC_TRIG_CONFIRM` | 64 点 | 16 点 | 标准音频包络必须连续越限的点数 |
 
 两板都使用 48 点滑动平均和 `max(nfar + 4, npk + 2, 本板下限)`。触发后对同一段采样分别做 chirp 相关和拍手瞬态识别，再发布唯一类别。拍手识别参数位于两板的 `Core/Inc/mic_clap.h`。
 
-TOA 报文以 `t2=1` 标记 chirp、`t2=2` 标记拍手。两板应成对更新固件。同类事件才可配对，两类结果分别保存历史和标准差。明确换侧时，若校准后时差的符号相反且前后幅值均达到门限（chirp 100 µs，拍手 400 µs），第一个有效配对即可更新方向；同侧大跳变仍需连续三个相互接近的候选确认。
+TOA 报文以 `t2=1` 标记 chirp、`t2=2` 标记拍手。两板应成对更新固件。同类事件且原始时间差不超过 7353 µs 才可配对，两类结果分别保存历史和标准差。明确换侧时，若校准后时差的符号相反且前后幅值均达到门限（chirp 100 µs，拍手 400 µs），第一个有效配对即可更新方向；同侧大跳变仍需连续三个相互接近的候选确认。
 
-参数位于 [A 板 mic.c](Board_A/Core/Src/mic.c) 和 [B 板 mic.c](Board_B/Core/Src/mic.c)。`Core/Src/freertos.c` 负责时钟同步和 TOA 报文，`Core/Src/disp.c` 负责触摸菜单、声速选择和测量结果显示，`LWIP/App/lwip.c` 设置本板地址。串口 USART1 为 115200 baud，`tg` 是包络触发次数，`ev` 是通过识别并发布的事件数，`rx` 是收到的对端 TOA 报文数，`pr` 是本板成功配对并接受的次数。
+任一板先识别出标准音频，另一板收到 TOA 报文后可在本地约 0.5 s 的采样缓存中回查。若本地候选与对端时刻相差超过 7353 µs，系统保留报文供回查，结合相关峰和分段一致性重新寻找直达声。标准音频使用按板间方向取符号的 16 µs 时差偏置和 26 µs 幅值偏置，校准值来自 205.7 cm 两侧测试。
+
+参数位于 [A 板 mic.c](Board_A/Core/Src/mic.c) 和 [B 板 mic.c](Board_B/Core/Src/mic.c)。`Core/Src/freertos.c` 负责时钟同步和 TOA 报文，`Core/Src/disp.c` 负责触摸菜单、声速选择和测量结果显示，`LWIP/App/lwip.c` 设置本板地址。串口 USART1 为 115200 baud，`tg` 是包络触发次数，`ev` 是通过识别并发布的事件数，`rx` 是收到的对端 TOA 报文数，`pr` 是本板成功配对并接受的次数。`[PEER]` 行中的 `attempts`、`history_gap`、`accepted` 和 `far` 分别记录回查尝试、缓存缺段、回查接受和超限拒绝次数。
 
 ## 温度模式与距离记录
 

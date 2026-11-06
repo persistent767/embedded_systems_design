@@ -33,6 +33,7 @@ extern volatile uint8_t mic_tdoa_kind;
 
 /* ---- 接口 ------------------------------------------------------------------ */
 void     mic_init(void);            /* 启动 TIM2 触发 + ADC3 + DMA 循环（任务里调） */
+void     mic_analysis_task(void *argument);
 void     mic_task(void *argument);  /* FreeRTOS 任务：搬副本、算包络、chirp 匹配、报到达时刻 */
 void     mic_isr_half(uint8_t half);/* 由 DMA2_Stream0 中断调用，只记一个时间戳 */
 uint8_t  mic_quiet_ok(void);        /* 伺服闸门：最近 50ms 内没有事件时返回 1 */
@@ -52,6 +53,7 @@ extern volatile int32_t mic_event_phase_end_us;   /* 匹配完成时的累计拨
 extern volatile uint32_t mic_match_best_q;     /* 最近一次匹配尝试峰值 ×1000 */
 extern volatile uint32_t mic_match_short_cnt;  /* 窗口不足 50 ms 的次数 */
 extern volatile uint32_t mic_match_reject_cnt; /* 相关不足门限的次数 */
+extern volatile uint32_t mic_weak_chirp_cnt, mic_peer_attempt_cnt, mic_peer_gap_cnt;
 extern volatile uint32_t mic_match_cost_us;    /* 最近一次匹配计算耗时 */
 extern volatile uint32_t mic_candidate_pk;     /* 最近一次候选事件的包络峰值，含被拒绝事件 */
 extern volatile uint32_t mic_candidate_trig;   /* 该候选事件触发时的门限 */

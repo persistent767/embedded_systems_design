@@ -27,6 +27,7 @@
 #include "usart.h"    /* huart1 */
 #include "mic_chirp_ref.h"
 #include "cmsis_os.h"
+#include "lwip/opt.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -37,9 +38,6 @@ extern uint8_t lt_mic_residual_at(uint32_t event_us, int32_t event_phase,
                                 int32_t *offset, uint32_t *age, uint32_t *used);
 static uint32_t mic_pend_subcnt;
 static volatile int32_t mic_epoch_phase_us[2];
-static int32_t mic_pend_sync_offset;
-static uint32_t mic_pend_sync_age;
-static uint8_t mic_pend_sync_valid;
 volatile uint32_t mic_event_raw_t_us;
 volatile int32_t mic_event_sync_offset_us;
 volatile uint32_t mic_event_sync_age_ms;
@@ -127,7 +125,6 @@ static uint32_t mic_pend_speed_x1000;
 static int32_t mic_pend_phase_start_us = 0;   /* 触发时的同步拨钟快照 */
 static uint32_t mic_pend_ms  = 0u;           /* 触发时刻（ms），用于 2s 超时 */
 static volatile uint8_t mic_active = 0u;     /* 1 = 正在跟踪一次声音 */
-static volatile uint8_t mic_arr_done = 0u;   /* 1 = 本次事件的到达时刻已算出 */
 
 /* ---- V6.0.2：完整 50 ms chirp 归一化匹配滤波 --------------------------------
    参考波形取自标准音频 chirp.wav 的 0.500~0.550 s，48 kHz 源，2:1 抽取到
@@ -148,7 +145,59 @@ static volatile uint8_t mic_arr_done = 0u;   /* 1 = 本次事件的到达时刻�
    的 rq/ct 用于验证弱信号相关值和计算耗时。 */
 #define MIC_CHIRP_DECIM    4u                              /* 96 kHz -> 24 kHz */
 #define MIC_CHIRP_X_N      (MIC_PEND_LEN / MIC_CHIRP_DECIM) /* 最多 2016 点 */
-#define MIC_CHIRP_MIN_R    0.26f                           /* 2 m 远板候选 rq=266~296；需实测误检和 TDOA */
+#define MIC_CHIRP_MIN_R    0.22f
+#define MIC_CHIRP_PEER_MIN_R 0.13f
+/* Max raw TOA difference for the 2.5 m test setup. */
+#define MIC_TDOA_VALID_US 7353u
+#define MIC_PEER_MARGIN_US 100u  /* Clock residual and 24 kHz sample rounding. */
+#define MIC_PEER_SEARCH_US (MIC_TDOA_VALID_US + MIC_PEER_MARGIN_US)
+#define MIC_CHIRP_ANCHOR_Q 500u
+#define MIC_PEER_HISTORY_LOW_BLOCKS 32u
+#define MIC_PEER_HISTORY_HIGH_BLOCKS 15u
+#define MIC_PEER_HISTORY_BLOCKS (MIC_PEER_HISTORY_LOW_BLOCKS + MIC_PEER_HISTORY_HIGH_BLOCKS)
+#define MIC_PEER_BLOCK_SAMPLES (MIC_HALF_SAMPLES / MIC_CHIRP_DECIM)
+#define MIC_PEER_WINDOW_SAMPLES (MIC_CHIRP_REF_N + (2u * MIC_PEER_SEARCH_US * 24u + 999u) / 1000u + 1u)
+#define MIC_PEER_WINDOW_END_US (MIC_PEER_SEARCH_US + 50000u)
+#define MIC_ANALYSIS_READY 1u
+
+typedef enum {
+  MIC_CAPTURE_IDLE,
+  MIC_CAPTURE_RECORDING,
+  MIC_CAPTURE_QUEUED
+} mic_capture_state_t;
+
+typedef struct {
+  uint32_t seq, time_us, speed_x1000;
+  int32_t phase_us;
+  uint16_t subcnt;
+} mic_peer_block_t;
+
+static volatile mic_capture_state_t mic_capture_state;
+static osThreadId_t mic_analysis_thread;
+static volatile uint8_t mic_pend_from_peer;
+static uint32_t mic_pend_peer_seq, mic_pend_peer_us;
+static uint32_t mic_peer_attempted_seq, mic_peer_attempted_us;
+static uint8_t mic_peer_attempted;
+
+static mic_peer_block_t mic_peer_blocks[MIC_PEER_HISTORY_BLOCKS];
+static uint8_t mic_peer_next, mic_peer_count;
+/* About 501 ms of history, split around the fixed LwIP heap.
+   The extra space after MEM_SIZE leaves room for the heap's end header. */
+#if (0x20044000u + MIC_PEER_HISTORY_LOW_BLOCKS * MIC_PEER_BLOCK_SAMPLES * 2u > LWIP_RAM_HEAP_POINTER) || \
+    (LWIP_RAM_HEAP_POINTER + MEM_SIZE + 0x100u > 0x2004A200u) || \
+    (0x2004A200u + MIC_PEER_HISTORY_HIGH_BLOCKS * MIC_PEER_BLOCK_SAMPLES * 2u > 0x2004C000u)
+#error "Microphone history overlaps the LwIP heap or ETH DMA descriptors"
+#endif
+#pragma location=0x20044000
+__no_init uint16_t mic_peer_samples_low[MIC_PEER_HISTORY_LOW_BLOCKS][MIC_PEER_BLOCK_SAMPLES];
+#pragma location=0x2004A200
+__no_init uint16_t mic_peer_samples_high[MIC_PEER_HISTORY_HIGH_BLOCKS][MIC_PEER_BLOCK_SAMPLES];
+
+static uint16_t *mic_peer_sample_block(uint32_t slot)
+{
+  if (slot < MIC_PEER_HISTORY_LOW_BLOCKS) { return mic_peer_samples_low[slot]; }
+  return mic_peer_samples_high[slot - MIC_PEER_HISTORY_LOW_BLOCKS];
+}
 
 static float mic_chirp_x[MIC_CHIRP_X_N];   /* 抽取后的接收信号，已去直流 */
 static float mic_chirp_energy[MIC_CHIRP_X_N - MIC_CHIRP_REF_N + 1u];
@@ -177,6 +226,9 @@ volatile int32_t mic_event_phase_end_us = 0;
 volatile uint32_t mic_match_best_q = 0u;  /* 最近一次匹配尝试的峰值 ×1000，失败也保留 */
 volatile uint32_t mic_match_short_cnt = 0u;  /* 收集不足 50 ms 的次数 */
 volatile uint32_t mic_match_reject_cnt = 0u; /* 相关系数未过门限的次数 */
+volatile uint32_t mic_weak_chirp_cnt = 0u;
+volatile uint32_t mic_peer_attempt_cnt = 0u;
+volatile uint32_t mic_peer_gap_cnt = 0u;
 volatile uint32_t mic_match_cost_us = 0u;   /* 最近一次匹配计算耗时 */
 volatile uint32_t mic_candidate_pk = 0u;
 volatile uint32_t mic_candidate_trig = 0u;
@@ -275,7 +327,7 @@ void mic_isr_half(uint8_t half)
 uint8_t mic_quiet_ok(void)
 {
   /* 到达时刻尚未算出时禁止拨钟；算完后不必等待事件状态机的静默/超时。 */
-  if ((mic_active != 0u) && (mic_arr_done == 0u)) { return 0u; }
+  if ((mic_capture_state != MIC_CAPTURE_IDLE) && (mic_pend_from_peer == 0u)) { return 0u; }
   return ((HAL_GetTick() - mic_last_evt_ms) > 50u) ? 1u : 0u;
 }
 
@@ -378,27 +430,47 @@ static float mic_chirp_score_at(uint32_t o)
   return (dot * dot) / ex;
 }
 
+static uint32_t mic_chirp_peak_pos256(uint32_t best, uint32_t max_lag, float r1)
+{
+  float r0, r2, den, xoff, pos;
+  r0 = (best > 0u)      ? sqrtf(mic_chirp_score_at(best - 1u) / mic_chirp_ref_ss) : r1;
+  r2 = (best < max_lag) ? sqrtf(mic_chirp_score_at(best + 1u) / mic_chirp_ref_ss) : r1;
+
+  den  = (r0 - (2.0f * r1)) + r2;
+  xoff = 0.0f;
+  if (den < -1.0e-6f)
+  {
+    xoff = (0.5f * (r0 - r2)) / den;
+    if (xoff >  0.5f) { xoff =  0.5f; }
+    if (xoff < -0.5f) { xoff = -0.5f; }
+  }
+
+  pos = (float)best + xoff;
+  if (pos < 0.0f) { pos = 0.0f; }
+  return (uint32_t)((pos * 256.0f) + 0.5f);
+
+}
+
 /* 在整段 84 ms 采集里搜完整 chirp。成功返回 1，并给出：
      pos256_out：chirp 起点相对采集窗口起点的位置，Q8（24 kHz 样本）
      r_out     ：峰值归一化相关系数
    相关峰用三点抛物线插值到亚样本；找不到足够强的峰就不发布。 */
-static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out)
+static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out, uint32_t n,
+                               float threshold)
 {
-  uint32_t n, max_lag, o, best = 0u, first = 0u, lo, hi;
+  uint32_t max_lag, o, best = 0u, first = 0u, lo, hi;
   uint8_t  have_first = 0u;
   float    score, best_score = -1.0f, min_score;
-  float    r0, r1, r2, den, xoff, pos;
 
   *pos256_out = 0u;
   *r_out      = 0.0f;
 
-  n = mic_chirp_decimate();
   if (n < MIC_CHIRP_REF_N) { return 0u; }
   if (mic_chirp_ref_ss <= 0.0f) { return 0u; }
 
   max_lag = n - MIC_CHIRP_REF_N;
   mic_chirp_energy_prepare(max_lag);
-  min_score = MIC_CHIRP_MIN_R * MIC_CHIRP_MIN_R * mic_chirp_ref_ss;
+  min_score = threshold * threshold * mic_chirp_ref_ss;
 
   /* 粗搜步长 2：24 kHz 下 chirp 相关主瓣宽约 4 个样本，步长 2 不会
      跳过主瓣；找到粗峰后再逐点细化 ±2。计算量约为全逐点搜索的一半，
@@ -447,24 +519,9 @@ static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out)
   }
 
   *r_out = sqrtf(best_score / mic_chirp_ref_ss);
-  if (*r_out < MIC_CHIRP_MIN_R) { return 0u; }
+  if (*r_out < threshold) { return 0u; }
 
-  r1 = *r_out;
-  r0 = (best > 0u)      ? sqrtf(mic_chirp_score_at(best - 1u) / mic_chirp_ref_ss) : r1;
-  r2 = (best < max_lag) ? sqrtf(mic_chirp_score_at(best + 1u) / mic_chirp_ref_ss) : r1;
-
-  den  = (r0 - (2.0f * r1)) + r2;
-  xoff = 0.0f;
-  if (den < -1.0e-6f)
-  {
-    xoff = (0.5f * (r0 - r2)) / den;
-    if (xoff >  0.5f) { xoff =  0.5f; }
-    if (xoff < -0.5f) { xoff = -0.5f; }
-  }
-
-  pos = (float)best + xoff;
-  if (pos < 0.0f) { pos = 0.0f; }
-  *pos256_out = (uint32_t)((pos * 256.0f) + 0.5f);
+  *pos256_out = mic_chirp_peak_pos256(best, max_lag, *r_out);
 
   return 1u;
 }
@@ -485,40 +542,17 @@ static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out)
    -------------------------------------------------------------------------- */
 #define MIC_TDOA_RING    8u        /* 记住本板最近 8 次事件 */
 #define MIC_TDOA_STAT    10u       /* 验收量的统计窗口 */
-#define MIC_TDOA_WIN_US  50000u    /* 配对窗口 ±50 ms：先把两边窗口内的
-                                      事件挑出来，下一关再由物理上限筛 */
-/* 物理上限不再按 20 cm 取。
-   任务书板距范围 0.20~10.00 m，10 m 的直达声上限 =
-   10 m ÷ 343 m/s ≈ 29.15 ms；再留约 5.8 ms 余量，取 35 ms。
-   这样 0.5 m、2 m、10 m 的 TDOA 都能进入配对/显示；
-   超过 35 ms 的配对仍判为假配对，只累加 mic_td_rej_far（串口 far）。
-   配对窗口 MIC_TDOA_WIN_US 仍为 ±50 ms，未放宽。 */
-#define MIC_TDOA_VALID_US 35000u
+#define MIC_TDOA_DIAG_US 50000u  /* Count rejected nearby events in far. */
 #define MIC_TDOA_STABLE_US 100u  /* 固定声源的单次跳变限值，约 3.4 cm @343 m/s */
 #define MIC_TDOA_NEW_US     60u  /* 新位置连续候选的相互容差，约 2.1 cm */
 #define MIC_TDOA_NEW_COUNT   3u  /* 连续 3 次才切换位置，单次反射不污染历史 */
 
-/* 固定幅度偏置标定（V6.0.2 必须做一次）：
-   在已知板距 D0（建议 0.500 m）、声源在两麦延长线上测一次 |DIFF|，
-   则 MIC_TDOA_CAL_US = |实测 DIFF| − D0/c（µs），可正可负。
-   代码按 DIFF 的符号对幅度做修正：
-       正的 DIFF：DIFF − CAL
-       负的 DIFF：DIFF + CAL
-   这样 A/B 两块屏幕的 |DIFF| 都会扣掉同一个固定幅度偏置；B 板 DIFF
-   显示相反符号是正常的（本板−对板），取绝对值即可。
-   注意：这不是 1 Hz 同步的 LT_OFF_CAL_US；它标定的是麦克风/模拟前端/
-   ADC/抽取滤波器/板间固定延迟，不能拿同步 CAL 来代替。
-   标定时两板相对声源的前后关系要与正式测量保持一致；若前后关系反了，
-   固定偏置的符号也会反，需要重新标定。
-   2026-10-28：直达峰选择和跳变筛选后，211.5/190.0/169.6 cm 三组
-   各 10 次读数的均值分别低 12.7/11.1/13.9 mm；按 343.42 m/s，
-   平均少约 36.6 us。旧 CAL=7 us，故本布置改为约 -30 us。
-   这属于本次固定布置的标定，换麦克风、声源侧或温度后需复测。 */
-/* 2026-10-31: 194.7/169.95 cm trials: mean excess 27.51/25.47 us.
-   Add rounded mean 26 us to previous CAL=-24 us; trial CAL=2 us. */
-#define MIC_TDOA_CAL_US (2)
+/* 205.7 cm end-on calibration, ~346 m/s. The two usable groups averaged
+   -5954/+5986 us on A after the old 2 us magnitude correction.
+   Remove 16 us of signed A-minus-B bias, then 26 us of range bias. */
+#define MIC_CHIRP_LOCAL_BIAS_US (16)
+#define MIC_CHIRP_RANGE_BIAS_US 26
 
-#define MIC_CLAP_TDOA_CAL_US     0
 #define MIC_CLAP_TDOA_STABLE_US 800u
 #define MIC_CLAP_TDOA_NEW_US    400u
 #define MIC_CLAP_DIRECTION_MIN_US 400  /* Ignore near-zero sign flips for fast switching. */
@@ -529,6 +563,8 @@ typedef struct
   uint32_t local_seq[MIC_TDOA_RING], local_us[MIC_TDOA_RING];
   uint32_t local_speed[MIC_TDOA_RING];
   uint8_t local_count, local_next;
+  uint32_t anchor_us;
+  uint8_t anchor_valid;
   uint32_t peer_seq, peer_us;
   uint8_t peer_pending;
   uint32_t used_peer_seq, used_local_seq;
@@ -561,15 +597,16 @@ volatile uint32_t mic_tdoa_pairs = 0u;        /* 配对成功次数（累计） 
 volatile uint32_t mic_tdoa_rxn   = 0u;        /* 收到对方报文条数（累计） */
 volatile uint32_t mic_td_rej_jump = 0u;       /* 与稳定位置不符而丢弃的配对 */
 
-/* 配对成功：登记 TDOA、重算相邻极差。调用者必须已经在临界区里。
-   差值一律按无符号算：两个时刻都在同一个 32 位 µs 计数上，回绕也正确。
-   MIC_TDOA_CAL_US 按 DIFF 的符号修正幅度，保证屏幕和 dj 都用同一套
-   固定幅度偏置。 */
+/* Wrapped subtraction gives the signed local-minus-peer difference. */
 static int32_t mic_td_corrected_us(uint32_t tl, uint32_t tp, uint8_t kind)
 {
   int32_t dt_raw = (int32_t)(tl - tp);
-  int32_t cal_us = (kind == MIC_EVENT_CLAP) ? MIC_CLAP_TDOA_CAL_US : MIC_TDOA_CAL_US;
-  return (dt_raw >= 0) ? (dt_raw - cal_us) : (dt_raw + cal_us);
+  if (kind != MIC_EVENT_CHIRP) { return dt_raw; }
+
+  dt_raw -= MIC_CHIRP_LOCAL_BIAS_US;
+  if (dt_raw > MIC_CHIRP_RANGE_BIAS_US) { return dt_raw - MIC_CHIRP_RANGE_BIAS_US; }
+  if (dt_raw < -MIC_CHIRP_RANGE_BIAS_US) { return dt_raw + MIC_CHIRP_RANGE_BIAS_US; }
+  return 0;
 }
 
 static void mic_td_commit(uint32_t lseq, uint32_t pseq, uint32_t tl, uint32_t tp,
@@ -731,12 +768,9 @@ static uint8_t mic_td_try(uint32_t lseq, uint32_t tl, uint32_t pseq, uint32_t tp
   mic_td_state_t *state = mic_td_state(kind);
   uint32_t d = mic_td_absdiff(tl, tp);
 
-  if (d > MIC_TDOA_WIN_US) { return 0u; }
   if (d > MIC_TDOA_VALID_US)
   {
-    /* 窗口内但差值大得物理上不可能：判为假配对，不登记。
-       现场来源：手机按"播放"那一下的瞬态只被近板触发、桌面/墙反射先过门限。 */
-    mic_td_rej_far++;
+    if (d <= MIC_TDOA_DIAG_US) { mic_td_rej_far++; }
     return 0u;
   }
 
@@ -753,7 +787,7 @@ static uint8_t mic_td_try(uint32_t lseq, uint32_t tl, uint32_t pseq, uint32_t tp
 }
 
 /* Publish a classified event in its own matching ring. */
-static void mic_td_local(uint32_t seq, uint32_t t_us, uint8_t kind)
+static void mic_td_local(uint32_t seq, uint32_t t_us, uint32_t speed_x1000, uint8_t kind, uint8_t anchor)
 {
   mic_td_state_t *state = mic_td_state(kind);
   taskENTER_CRITICAL();
@@ -763,18 +797,24 @@ static void mic_td_local(uint32_t seq, uint32_t t_us, uint8_t kind)
     mic_td_active_kind = kind;
   }
 
+  if (anchor != 0u)
+  {
+    state->anchor_us = t_us;
+    state->anchor_valid = 1u;
+  }
   state->local_seq[state->local_next] = seq;
   state->local_us [state->local_next] = t_us;
-  state->local_speed[state->local_next] = mic_pend_speed_x1000;
+  state->local_speed[state->local_next] = speed_x1000;
   state->local_next = (uint8_t)((state->local_next + 1u) % MIC_TDOA_RING);
   if (state->local_count < MIC_TDOA_RING) { state->local_count++; }
 
   /* 对方的报文先到了：这一拍把另一半补上 */
   if ((state->peer_pending != 0u) && (state->peer_seq != state->used_peer_seq))
   {
-    (void)mic_td_try(seq, t_us, state->peer_seq, state->peer_us, mic_pend_speed_x1000, kind);
+    (void)mic_td_try(seq, t_us, state->peer_seq, state->peer_us, speed_x1000, kind);
+    /* An out-of-range peak must leave the peer report available for replay. */
+    if (state->peer_seq == state->used_peer_seq) { state->peer_pending = 0u; }
   }
-  state->peer_pending = 0u;      /* 对方那一条只用一次，配不上就作废 */
 
   taskEXIT_CRITICAL();
 }
@@ -872,7 +912,7 @@ uint8_t mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
 /* A remote TOA can only match a local event of the same type. */
 void mic_tdoa_rx(uint32_t seq, uint32_t t_us, uint32_t kind)
 {
-  uint8_t  i, best = 0xFFu;
+  uint8_t  i, best = 0xFFu, far = 0u;
   uint32_t bd = 0xFFFFFFFFu;
   mic_td_state_t *state;
 
@@ -890,7 +930,12 @@ void mic_tdoa_rx(uint32_t seq, uint32_t t_us, uint32_t kind)
       uint32_t tl = state->local_us[j];
       uint32_t d  = mic_td_absdiff(tl, t_us);
 
-      if ((state->local_seq[j] == state->used_local_seq) || (d > MIC_TDOA_WIN_US)) { continue; }
+      if (state->local_seq[j] == state->used_local_seq) { continue; }
+      if (d > MIC_TDOA_VALID_US)
+      {
+        if (d <= MIC_TDOA_DIAG_US) { far = 1u; }
+        continue;
+      }
       if (d < bd) { bd = d; best = j; }
     }
 
@@ -902,6 +947,7 @@ void mic_tdoa_rx(uint32_t seq, uint32_t t_us, uint32_t kind)
     else
     {
       /* 本板还没有对得上的一拍：先存着，等本板下一个事件来配 */
+      mic_td_rej_far += far;
       mic_tdoa_nomatch++;    /* 诊断：收到报文但本板窗口内没有可配的事件 */
       state->peer_seq = seq;
       state->peer_us  = t_us;
@@ -941,16 +987,166 @@ static uint8_t mic_chirp_has_coverage(uint32_t pos256, uint32_t noise)
   return (uint8_t)(covered >= 4u);
 }
 
+typedef struct {
+  uint32_t raw_us, time_us, pos256, speed_x1000, peak, correlation_q;
+  uint32_t sync_age_ms, sync_samples;
+  int32_t phase_start_us, phase_end_us, sync_offset_us;
+  uint8_t sync_valid;
+} mic_toa_candidate_t;
+
+static void mic_prepare_toa(mic_toa_candidate_t *event, uint32_t pos256, uint32_t peak)
+{
+  /* pos256 is Q8 on the 24 kHz grid. Keep the captured fractional time. */
+  event->raw_us = mic_pend_us
+       + (uint32_t)((((uint64_t)mic_pend_subcnt * 256u) +
+                     ((uint64_t)pos256 * (MIC_CHIRP_DECIM * MIC_CNT_PER_SMP)) +
+                     (108u * 128u)) / (108u * 256u));
+  event->pos256 = pos256;
+  event->speed_x1000 = mic_pend_speed_x1000;
+  event->peak = peak;
+  event->correlation_q = mic_match_best_q;
+  event->phase_start_us = mic_pend_phase_start_us;
+  event->phase_end_us = lt_acoustic_phase_snapshot_us();
+  event->sync_valid = lt_mic_residual_at(event->raw_us, event->phase_start_us,
+                     &event->sync_offset_us, &event->sync_age_ms, &event->sync_samples);
+  event->time_us = event->raw_us - (uint32_t)event->sync_offset_us;
+}
+
+static void mic_publish_toa(const mic_toa_candidate_t *event, uint8_t kind)
+{
+  uint8_t anchor = (uint8_t)((kind == MIC_EVENT_CHIRP) && (mic_pend_from_peer == 0u) &&
+                             (event->correlation_q >= MIC_CHIRP_ANCHOR_Q));
+
+  mic_event_raw_t_us = event->raw_us;
+  mic_event_sync_offset_us = event->sync_offset_us;
+  mic_event_sync_age_ms = event->sync_age_ms;
+  mic_event_sync_valid = event->sync_valid;
+  mic_event_sync_samples = event->sync_samples;
+  mic_event_t_us = event->time_us;
+  mic_event_pos256 = event->pos256;
+  mic_event_phase_start_us = event->phase_start_us;
+  mic_event_phase_end_us = event->phase_end_us;
+  mic_event_kind = kind;
+  mic_event_seq++;
+  mic_td_local(mic_event_seq, event->time_us, event->speed_x1000, kind, anchor);
+  mic_last_pk = event->peak;
+  mic_last_corr_q = event->correlation_q;
+}
+
+/* Require matching sweep content in multiple parts of the template.
+   The sign can be either polarity, but should agree across the sweep. */
+static uint8_t mic_peer_sweep_consistent(uint32_t pos256)
+{
+  const uint32_t width = MIC_CHIRP_REF_N / 5u;
+  uint32_t i, part, positive = 0u, negative = 0u;
+  uint32_t start = (pos256 + 128u) / 256u;
+
+  for (part = 0u; part < 5u; ++part)
+  {
+    float dot = 0.0f, energy = 0.0f, ref_energy = 0.0f;
+    for (i = part * width; i < (part + 1u) * width; ++i)
+    {
+      float x = mic_chirp_x[start + i];
+      float ref = (float)mic_chirp_ref[i];
+      dot += x * ref;
+      energy += x * x;
+      ref_energy += ref * ref;
+    }
+    if ((energy > 0.0f) && ((dot * dot) >= 0.0025f * energy * ref_energy))
+    {
+      if (dot > 0.0f) { ++positive; }
+      else { ++negative; }
+    }
+  }
+  return (uint8_t)((positive >= 3u) || (negative >= 3u));
+}
+
+/* Sweep only physically admissible lags. A peak that fails the sweep
+   consistency check must not hide a weaker coherent peak. */
+static uint8_t mic_chirp_match_peer(int32_t start_diff_us, uint32_t *pos256, float *r_out)
+{
+  const uint32_t max_lag = MIC_PEER_WINDOW_SAMPLES - MIC_CHIRP_REF_N;
+  const float min_score = MIC_CHIRP_PEER_MIN_R * MIC_CHIRP_PEER_MIN_R * mic_chirp_ref_ss;
+  float left = -1.0f, score, right, best_score = -1.0f, max_score = 0.0f;
+  uint32_t lag, best = 0u;
+
+  *r_out = 0.0f;
+  if (mic_chirp_ref_ss <= 0.0f) { return 0u; }
+  mic_chirp_energy_prepare(max_lag);
+  score = mic_chirp_score_at(0u);
+  for (lag = 0u; lag <= max_lag; ++lag)
+  {
+    int32_t diff_us = start_diff_us + (int32_t)((lag * 1000u + 12u) / 24u);
+    right = (lag < max_lag) ? mic_chirp_score_at(lag + 1u) : -1.0f;
+    if ((diff_us >= -(int32_t)MIC_TDOA_VALID_US) && (diff_us <= (int32_t)MIC_TDOA_VALID_US))
+    {
+      if (score > max_score) { max_score = score; }
+      if ((score >= min_score) && (score > best_score) && (score > left) &&
+          (score >= right) && (mic_peer_sweep_consistent(lag * 256u) != 0u))
+      {
+        best = lag;
+        best_score = score;
+      }
+    }
+    left = score;
+    score = right;
+  }
+  if (best_score < 0.0f)
+  {
+    *r_out = sqrtf(max_score / mic_chirp_ref_ss);
+    return 0u;
+  }
+  *r_out = sqrtf(best_score / mic_chirp_ref_ss);
+  *pos256 = mic_chirp_peak_pos256(best, max_lag, *r_out);
+  return 1u;
+}
+
+static void mic_finalize_peer_chirp(void)
+{
+  uint32_t i, pos256;
+  uint32_t sum = 0u;
+  float rr, mean;
+  uint8_t matched;
+  uint64_t t_calc = lt_now_cnt();
+  mic_toa_candidate_t event;
+  const mic_td_state_t *state;
+
+  for (i = 0u; i < MIC_PEER_WINDOW_SAMPLES; ++i)
+    sum += (uint16_t)mic_pend_raw[i];
+  mean = (float)sum / (float)MIC_PEER_WINDOW_SAMPLES;
+  for (i = 0u; i < MIC_PEER_WINDOW_SAMPLES; ++i)
+    mic_chirp_x[i] = ((float)mic_pend_raw[i] - mean) / (float)MIC_CHIRP_DECIM;
+
+  mic_prepare_toa(&event, 0u, mic_pend_pk);
+  matched = mic_chirp_match_peer((int32_t)(event.time_us - mic_pend_peer_us), &pos256, &rr);
+  mic_match_cost_us = (uint32_t)((lt_now_cnt() - t_calc) / 108u);
+  mic_match_best_q = (uint32_t)((rr * 1000.0f) + 0.5f);
+  if (matched == 0u) { return; }
+
+  mic_prepare_toa(&event, pos256, mic_pend_pk);
+  if (mic_td_absdiff(event.time_us, mic_pend_peer_us) > MIC_TDOA_VALID_US) { return; }
+
+  taskENTER_CRITICAL();
+  state = mic_td_state(MIC_EVENT_CHIRP);
+  if ((state->peer_pending != 0u) && (state->peer_seq == mic_pend_peer_seq) &&
+      (state->peer_us == mic_pend_peer_us) && (state->used_peer_seq != mic_pend_peer_seq))
+  {
+    mic_weak_chirp_cnt++;
+    mic_publish_toa(&event, MIC_EVENT_CHIRP);
+  }
+  taskEXIT_CRITICAL();
+}
+
 static void mic_finalize(void)
 {
   uint32_t pk = mic_pend_pk;
   uint32_t pos256 = 0u;
-  uint32_t t_us;
   uint64_t t_calc;
   float    rr = 0.0f;
   uint8_t  kind = MIC_EVENT_NONE;
   uint8_t  chirp_ok, clap_ok;
   mic_clap_result_t clap;
+  mic_toa_candidate_t event;
 
   mic_candidate_pk = pk;
 
@@ -959,12 +1155,11 @@ static void mic_finalize(void)
     /* 还不到 50 ms，不可能覆盖完整 chirp；不发布。 */
     mic_match_best_q = 0u;
     mic_match_short_cnt++;
-    mic_arr_done = 1u;
     return;
   }
 
   t_calc = lt_now_cnt();
-  chirp_ok = mic_chirp_match(&pos256, &rr);
+  chirp_ok = mic_chirp_match(&pos256, &rr, mic_chirp_decimate(), MIC_CHIRP_MIN_R);
   clap_ok = mic_clap_analyze(mic_pend_raw, mic_pend_n, &clap);
   if (chirp_ok == 0u) { mic_match_reject_cnt++; }
 
@@ -986,45 +1181,154 @@ static void mic_finalize(void)
   if (rr < 0.0f) { rr = 0.0f; }
   if (rr > 1.0f) { rr = 1.0f; }
   mic_match_best_q = (uint32_t)((rr * 1000.0f) + 0.5f);
-  if (kind == MIC_EVENT_NONE)
+  if (kind != MIC_EVENT_NONE)
   {
-    mic_arr_done = 1u;
+    mic_prepare_toa(&event, pos256, pk);
+    mic_publish_toa(&event, kind);
+  }
+}
+
+void mic_analysis_task(void *argument)
+{
+  (void)argument;
+  for (;;)
+  {
+    uint32_t flags = osThreadFlagsWait(MIC_ANALYSIS_READY, osFlagsWaitAny, osWaitForever);
+    if ((flags & osFlagsError) == 0u)
+    {
+      if (mic_pend_from_peer != 0u) { mic_finalize_peer_chirp(); }
+      else { mic_finalize(); }
+      mic_capture_state = MIC_CAPTURE_IDLE;
+    }
+  }
+}
+
+static void mic_queue_analysis(void)
+{
+  mic_capture_state = MIC_CAPTURE_QUEUED;
+  if ((osThreadFlagsSet(mic_analysis_thread, MIC_ANALYSIS_READY) & osFlagsError) != 0u)
+  {
+    mic_capture_state = MIC_CAPTURE_IDLE;
+  }
+}
+
+static void mic_record_peer_half(uint64_t t0, uint32_t seq, int32_t phase)
+{
+  uint32_t i, j;
+  uint16_t *samples = mic_peer_sample_block(mic_peer_next);
+  mic_peer_block_t *block = &mic_peer_blocks[mic_peer_next];
+
+  for (i = 0u; i < MIC_PEER_BLOCK_SAMPLES; ++i)
+  {
+    uint16_t sum = 0u;
+    for (j = 0u; j < MIC_CHIRP_DECIM; ++j)
+      sum += mic_work[i * MIC_CHIRP_DECIM + j];
+    samples[i] = sum;
+  }
+  block->seq = seq;
+  block->time_us = (uint32_t)(t0 / 108u);
+  block->subcnt = (uint16_t)(t0 % 108u);
+  block->phase_us = phase;
+  block->speed_x1000 = disp_measurement_speed_x1000();
+  mic_peer_next = (uint8_t)((mic_peer_next + 1u) % MIC_PEER_HISTORY_BLOCKS);
+  if (mic_peer_count < MIC_PEER_HISTORY_BLOCKS) { ++mic_peer_count; }
+}
+
+static uint8_t mic_copy_peer_window(uint32_t target_us, int32_t phase)
+{
+  const uint32_t ticks_per_sample = MIC_CNT_PER_SMP * MIC_CHIRP_DECIM;
+  uint32_t slot = (mic_peer_next + MIC_PEER_HISTORY_BLOCKS - mic_peer_count) % MIC_PEER_HISTORY_BLOCKS;
+  uint32_t i;
+
+  for (i = 0u; i < mic_peer_count; ++i)
+  {
+    const mic_peer_block_t *block = &mic_peer_blocks[slot];
+    int32_t dt = (int32_t)(target_us + (uint32_t)phase - block->time_us - (uint32_t)block->phase_us);
+    int64_t offset_ticks = (int64_t)dt * 108 - block->subcnt;
+
+    if ((offset_ticks >= 0) && (offset_ticks < (int64_t)MIC_PEER_BLOCK_SAMPLES * ticks_per_sample))
+    {
+      uint32_t start = (uint32_t)(offset_ticks / ticks_per_sample);
+      uint32_t offset = start, done = 0u, sequence = block->seq;
+      uint32_t remaining_blocks = mic_peer_count - i;
+      uint32_t start_ticks = block->subcnt + start * ticks_per_sample;
+      uint16_t min_code = UINT16_MAX, max_code = 0u;
+
+      mic_pend_us = block->time_us + start_ticks / 108u;
+      mic_pend_subcnt = start_ticks % 108u;
+      mic_pend_phase_start_us = block->phase_us;
+      mic_pend_speed_x1000 = block->speed_x1000;
+      while ((done < MIC_PEER_WINDOW_SAMPLES) && (remaining_blocks != 0u))
+      {
+        const uint16_t *samples;
+        if (mic_peer_blocks[slot].seq != sequence) { return 0u; }
+        samples = mic_peer_sample_block(slot);
+        for (; (offset < MIC_PEER_BLOCK_SAMPLES) && (done < MIC_PEER_WINDOW_SAMPLES); ++offset)
+        {
+          uint16_t value = samples[offset];
+          mic_pend_raw[done++] = (int16_t)value;
+          if (value < min_code) { min_code = value; }
+          if (value > max_code) { max_code = value; }
+        }
+        offset = 0u;
+        slot = (slot + 1u) % MIC_PEER_HISTORY_BLOCKS;
+        ++sequence;
+        --remaining_blocks;
+      }
+      mic_pend_pk = (uint32_t)(max_code - min_code) / (2u * MIC_CHIRP_DECIM);
+      return (uint8_t)(done == MIC_PEER_WINDOW_SAMPLES);
+    }
+    slot = (slot + 1u) % MIC_PEER_HISTORY_BLOCKS;
+  }
+  return 0u;
+}
+
+static void mic_try_peer_capture(void)
+{
+  const mic_peer_block_t *newest;
+  const mic_td_state_t *state, *clap;
+  uint32_t peer_seq, peer_us;
+  uint8_t pending;
+
+  if ((mic_capture_state != MIC_CAPTURE_IDLE) || (mic_peer_count == 0u)) { return; }
+
+  taskENTER_CRITICAL();
+  state = mic_td_state(MIC_EVENT_CHIRP);
+  pending = (uint8_t)((state->peer_pending != 0u) && (state->peer_seq != state->used_peer_seq));
+  peer_seq = state->peer_seq;
+  peer_us = state->peer_us;
+  clap = mic_td_state(MIC_EVENT_CLAP);
+  /* A conflicting remote timestamp cannot pull a strong standalone chirp
+     onto a later reflection. Protect confirmed clap pairs as well. */
+  if (((state->anchor_valid != 0u) &&
+       (mic_td_absdiff(state->anchor_us, peer_us) <= MIC_TDOA_DIAG_US)) ||
+      ((clap->last_pair_seq != 0u) &&
+       (mic_td_absdiff(clap->last_local_us, peer_us) <= MIC_TDOA_VALID_US)))
+  {
+    pending = 0u;
+  }
+  taskEXIT_CRITICAL();
+
+  if ((pending == 0u) || ((mic_peer_attempted != 0u) &&
+      (peer_seq == mic_peer_attempted_seq) && (peer_us == mic_peer_attempted_us))) { return; }
+
+  newest = &mic_peer_blocks[(mic_peer_next + MIC_PEER_HISTORY_BLOCKS - 1u) % MIC_PEER_HISTORY_BLOCKS];
+  if ((int32_t)(newest->time_us - peer_us) < (int32_t)MIC_PEER_WINDOW_END_US) { return; }
+
+  mic_peer_attempted = 1u;
+  mic_peer_attempted_seq = peer_seq;
+  mic_peer_attempted_us = peer_us;
+  if (mic_copy_peer_window(peer_us - MIC_PEER_SEARCH_US, newest->phase_us) == 0u)
+  {
+    mic_peer_gap_cnt++;
     return;
   }
 
-  /* pos256 是 24 kHz 样本位置，1 个 24 kHz 样本 = 4 个 96 kHz 样本
-     = 4 × 1125 个 TIM5 计数。换算成 µs 后加上采集窗口起点。 */
-  t_us = mic_pend_us
-       + (uint32_t)((((uint64_t)mic_pend_subcnt * 256u) +
-                     ((uint64_t)pos256 * (MIC_CHIRP_DECIM * MIC_CNT_PER_SMP)) +
-                     (108u * 128u)) / (108u * 256u));
-  mic_event_raw_t_us = t_us;
-  {
-    uint32_t used;
-    mic_pend_sync_valid = lt_mic_residual_at(t_us, mic_pend_phase_start_us,
-                              &mic_pend_sync_offset, &mic_pend_sync_age, &used);
-    mic_event_sync_samples = used;
-  }
-  mic_event_sync_offset_us = mic_pend_sync_offset;
-  mic_event_sync_age_ms = mic_pend_sync_age;
-  mic_event_sync_valid = mic_pend_sync_valid;
-  /* B minus A residual: subtract on B's TOA before sending to either board.
-     Preserve raw TOA above for verification; no averaging or sample rejection. */
-  t_us -= (uint32_t)mic_pend_sync_offset;
-
-  mic_event_t_us = t_us;
-  mic_event_pos256 = pos256;
-  mic_event_phase_start_us = mic_pend_phase_start_us;
-  mic_event_phase_end_us = lt_acoustic_phase_snapshot_us();
-  mic_event_kind = kind;
-  mic_event_seq++;
-
-  /* 跨板 TDOA：把这一拍登记进本板的事件环，顺便试试能不能跟对方的报文配对。 */
-  mic_td_local(mic_event_seq, t_us, kind);
-
-  mic_last_pk = pk;
-  mic_last_corr_q = mic_match_best_q;
-  mic_arr_done = 1u;
+  mic_peer_attempt_cnt++;
+  mic_pend_peer_seq = peer_seq;
+  mic_pend_peer_us = peer_us;
+  mic_pend_from_peer = 1u;
+  mic_queue_analysis();
 }
 
 /* ---- 一个半缓冲的处理 ------------------------------------------------------
@@ -1048,6 +1352,7 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
   uint8_t  triggered = 0u;
 
   memcpy(mic_work, (const void *)&mic_buf[half * MIC_HALF_SAMPLES], sizeof(mic_work));
+  mic_record_peer_half(t0, seq_id, epoch_phase);
   mic_min_code = 4095;
   mic_max_code = 0;
 
@@ -1089,9 +1394,7 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
      如静默时 tg 增长，需根据 [MIC] 的 mx/nf/trg 再校准。 */
   trig = mic_nfar + 4;
   if (trig < (mic_npk + 2)) { trig = mic_npk + 2; }
-  /* A 板曾实测静默包络约 5~8；下限从 12 试降到 10，
-     现场需确认静默时 tg 不会持续增长。 */
-  if (trig < 10) { trig = 10; }
+  if (trig < 16) { trig = 16; }  /* Minimum envelope threshold in ADC counts. */
   low = trig - 1;
   if (low < 3) { low = 3; }
   mic_last_trig = (uint32_t)trig;
@@ -1149,7 +1452,7 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
         V6.0 不再用任何单频门控：假触发由"门限压在环境峰值之上
          （trig >= npk+2）"和 64 点连续确认一起挡，任何频率的真声都能进。 */
     if ((mic_active == 0u) && (mic_armed != 0u) && (mic_edge_ok != 0u) &&
-        (mic_hist_fill >= hist_need) &&
+        (mic_capture_state == MIC_CAPTURE_IDLE) && (mic_hist_fill >= hist_need) &&
         ((now - mic_last_evt_ms) >= 100u))
     {
       if (env > trig)
@@ -1189,7 +1492,8 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
           mic_pend_ms    = now;
           mic_pend_half_id = seq_id;
           mic_active     = 1u;
-          mic_arr_done   = 0u;
+          mic_pend_from_peer = 0u;
+          mic_capture_state = MIC_CAPTURE_RECORDING;
           mic_armed      = 0u;
           mic_edge_ok    = 0u;     /* V5：要等包络回落后才允许下一次起音 */
           mic_quiet_ms   = 0u;
@@ -1207,7 +1511,7 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
   }
 
   /* ③ ACTIVE：把本半缓冲的剩余样本续进 84 ms 事件窗口。 */
-  if ((mic_active != 0u) && (mic_arr_done == 0u))
+  if (mic_capture_state == MIC_CAPTURE_RECORDING)
   {
     if (triggered != 0u)
     {
@@ -1235,9 +1539,9 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
      的 TDOA 误差。连续 60 ms 安静只负责结束事件，不再提前精化。 */
   if (mic_active != 0u)
   {
-    if ((mic_arr_done == 0u) && (mic_pend_n >= MIC_PEND_LEN))
+    if ((mic_capture_state == MIC_CAPTURE_RECORDING) && (mic_pend_n >= MIC_PEND_LEN))
     {
-      mic_finalize();
+      mic_queue_analysis();
     }
 
     if (mx < low)
@@ -1245,7 +1549,7 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
       if (mic_quiet_ms == 0u) { mic_quiet_ms = now; }
       else if ((now - mic_quiet_ms) >= 60u)
       {
-        if (mic_arr_done == 0u) { mic_finalize(); }
+        if (mic_capture_state == MIC_CAPTURE_RECORDING) { mic_queue_analysis(); }
 
         mic_last_evt_ms = now;
         mic_active      = 0u;
@@ -1262,7 +1566,7 @@ static void mic_process_half(uint8_t half, uint64_t t0, uint32_t seq_id, int32_t
     /* 2s 超时兜底。 */
     if ((now - mic_pend_ms) > 2000u)
     {
-      if (mic_arr_done == 0u) { mic_finalize(); }
+      if (mic_capture_state == MIC_CAPTURE_RECORDING) { mic_queue_analysis(); }
       mic_last_evt_ms = now;
       mic_active      = 0u;
       mic_armed       = 1u;
@@ -1285,21 +1589,27 @@ static void mic_abort_event(void)
   mic_abs_sum = 0u;
   mic_abs_idx = 0u;
   memset(mic_abs_hist, 0, sizeof(mic_abs_hist));
-  mic_dc_q8 = (2048 << 8);
+  mic_hist_fill = 0u;
 
-  mic_last_evt_ms  = HAL_GetTick();
-  mic_active       = 0u;
-  mic_armed        = 1u;
-  mic_arr_done     = 1u;
-  mic_pend_n       = 0u;
-  mic_quiet_ms     = 0u;
-  mic_pend_half_id = 0xFFFFFFFFu;
+  if (mic_capture_state == MIC_CAPTURE_RECORDING)
+  {
+    mic_capture_state = MIC_CAPTURE_IDLE;
+    mic_pend_n = 0u;
+  }
+  if (mic_active != 0u)
+  {
+    mic_last_evt_ms  = HAL_GetTick();
+    mic_active       = 0u;
+    mic_armed        = 1u;
+    mic_quiet_ms     = 0u;
+    mic_pend_half_id = 0xFFFFFFFFu;
+  }
 }
 
 /* ---- 任务 ------------------------------------------------------------------ */
 void mic_task(void *argument)
 {
-  (void)argument;
+  mic_analysis_thread = (osThreadId_t)argument;
 
   for (;;)
   {
@@ -1325,11 +1635,12 @@ void mic_task(void *argument)
       if ((uint32_t)(seq - mic_seen_seq) > 1u)
       {
         mic_overruns += (seq - mic_seen_seq - 1u);
-        if (mic_active != 0u) { mic_abort_event(); }
+        mic_abort_event();
       }
       mic_seen_seq = seq;
       mic_process_half(half, t0, seq, epoch_phase);
     }
+    mic_try_peer_capture();
     osDelay(2);
   }
 }
