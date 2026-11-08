@@ -6,6 +6,8 @@
 *.dep
 *.pbi
 *.hex
+!/Board_A/Firmware/LT_KeShe.hex
+!/Board_B/Firmware/LT_KeShe_B.hex
 *.out
 *.axf
 *.o

@@ -79,6 +79,10 @@ typedef struct
 #define LT_MSG_DREQ         2U
 #define LT_MSG_DRESP        3U
 #define LT_MSG_TOA          4U      /* 声到达时刻交换：新加的，不参与同步伺服 */
+#define LT_TEMP_MODE_TAG   0x54U   /* pad[1]: DREQ.t1 or DRESP.t2 carries selection. */
+#define LT_TEMP_OPTION_MASK 0x07U
+#define LT_TEMP_MASTER_BIT  0x08U
+#define LT_TEMP_VERSION_STEP 0x10U
 #define LT_FLAG_FF_READY    0x01U   /* DREQ.pad[0]：从板频率预标定已结束 */
 #define LT_DLY_ACCEPT_US    20U
 #define LT_DLY_RECENT_MS    2000U   /* V5.8：dly 地板只统计最近 2 秒的样本。
@@ -496,6 +500,60 @@ int32_t lt_phase_snapshot_us(void)
   return lt_phase_total_us;
 }
 
+/* Pack revision, writer role and preset in one atomic word. For the same
+   revision, the master's write sorts higher. Do not use clock sync for UI ordering. */
+static volatile uint32_t lt_temp_state = DISP_TEMP_AUTO;
+static uint8_t lt_temp_peer_seen, lt_temp_pending_initial;
+
+static uint32_t lt_temp_next_state(uint32_t base, uint8_t selection)
+{
+  uint32_t revision = (base & ~(LT_TEMP_VERSION_STEP - 1u)) + LT_TEMP_VERSION_STEP;
+  return revision | ((lt_is_master != 0u) ? LT_TEMP_MASTER_BIT : 0u) | selection;
+}
+
+void lt_temp_select(uint8_t selection)
+{
+  if (selection > DISP_TEMP_AUTO) { return; }
+  taskENTER_CRITICAL();
+  lt_temp_state = lt_temp_next_state(lt_temp_state, selection);
+  if (lt_temp_peer_seen == 0u) { lt_temp_pending_initial = 1u; }
+  taskEXIT_CRITICAL();
+}
+
+uint8_t lt_temp_selected(void)
+{
+  return (uint8_t)(lt_temp_state & LT_TEMP_OPTION_MASK);
+}
+
+static void lt_temp_receive(const struct sockaddr_in *from, uint8_t tag, uint32_t incoming)
+{
+  uint32_t current;
+  uint8_t newer;
+
+  if ((tag != LT_TEMP_MODE_TAG) || (from->sin_addr.s_addr != lt_peer.sin_addr.s_addr) ||
+      (from->sin_port != lt_peer.sin_port) || ((incoming & LT_TEMP_OPTION_MASK) > DISP_TEMP_AUTO))
+  {
+    return;
+  }
+  taskENTER_CRITICAL();
+  current = lt_temp_state;
+  newer = (uint8_t)((int32_t)(incoming - current) > 0);
+  lt_temp_peer_seen = 1u;
+  if (lt_temp_pending_initial != 0u)
+  {
+    /* A local touch made before the first peer packet must survive a reboot
+       where the other board still holds a much larger revision. */
+    lt_temp_state = lt_temp_next_state((newer != 0u) ? incoming : current,
+                                       (uint8_t)(current & LT_TEMP_OPTION_MASK));
+    lt_temp_pending_initial = 0u;
+  }
+  else if (newer != 0u)
+  {
+    lt_temp_state = incoming;
+  }
+  taskEXIT_CRITICAL();
+}
+
 /* 串口打印：直接走 USART1，不依赖 printf 重定向 */
 static void lt_log(const char *fmt, ...)
 {
@@ -514,6 +572,58 @@ static void lt_log(const char *fmt, ...)
       n = (int)(sizeof(buf) - 1U);
     }
     (void)HAL_UART_Transmit(&huart1, (uint8_t *)buf, (uint16_t)n, 200U);
+  }
+}
+
+/* Consume a bounded number of quality records per network task iteration. */
+static void lt_log_pair_quality(void)
+{
+  static uint32_t last_dropped;
+  mic_pair_quality_t result;
+  uint32_t dropped;
+  uint8_t i;
+
+  for (i = 0u; (i < 2u) && (mic_tdoa_quality_pop(&result) != 0u); ++i)
+  {
+    const mic_signal_quality_t *signal = &result.signal;
+    int32_t ab_diff_us = (lt_is_master != 0u) ? result.tdoa_us : -result.tdoa_us;
+    const char *direction = (ab_diff_us < 0) ? "A" : ((ab_diff_us > 0) ? "B" : "CENTER");
+    char distance[20] = "--";
+
+    if (result.distance_mm != MIC_DISTANCE_UNAVAILABLE)
+    {
+      (void)snprintf(distance, sizeof(distance), "%lu.%lucm",
+                     (unsigned long)(result.distance_mm / 10u),
+                     (unsigned long)(result.distance_mm % 10u));
+    }
+    if (result.kind == MIC_EVENT_CHIRP)
+    {
+      lt_log("[QUAL] pr %lu ev %lu peer %lu n %lu reset %u CHIRP src %s rq %u gate %u rms10 %u pp10 %u dist %s dir %s\r\n",
+             (unsigned long)result.pair_seq, (unsigned long)result.local_seq,
+             (unsigned long)result.peer_seq, (unsigned long)result.sd_count,
+             (unsigned)result.new_distance, (signal->chirp.replay != 0u) ? "replay" : "local",
+             (unsigned)signal->chirp.rq, (unsigned)signal->chirp.gate,
+             (unsigned)signal->chirp.rms10, (unsigned)signal->chirp.pp10, distance, direction);
+    }
+    else
+    {
+      uint32_t pn10 = (signal->clap.noise != 0u) ?
+                      (10u * signal->clap.peak + signal->clap.noise / 2u) / signal->clap.noise : 0u;
+      lt_log("[QUAL] pr %lu ev %lu peer %lu n %lu reset %u CLAP pk %u nf %u pn10 %lu rise_us %u width_us %u early %u%% clip %u dist %s dir %s\r\n",
+             (unsigned long)result.pair_seq, (unsigned long)result.local_seq,
+             (unsigned long)result.peer_seq, (unsigned long)result.sd_count,
+             (unsigned)result.new_distance, (unsigned)signal->clap.peak,
+             (unsigned)signal->clap.noise, (unsigned long)pn10,
+             (unsigned)signal->clap.rise_us, (unsigned)signal->clap.width_us,
+             (unsigned)signal->clap.early_percent, (unsigned)signal->clap.clipped, distance, direction);
+    }
+  }
+
+  dropped = mic_tdoa_quality_dropped;
+  if (dropped != last_dropped)
+  {
+    last_dropped = dropped;
+    lt_log("[QUAL] dropped %lu\r\n", (unsigned long)dropped);
   }
 }
 
@@ -1407,6 +1517,7 @@ static void lt_tx_task(void *argument)
                 (unsigned long)mic_td_rej_jump,
                 mic_tdoa_kind == MIC_EVENT_CLAP ? "CLAP" : "CHIRP");
       }
+      lt_log_pair_quality();
       if (mic_overruns != s_dbg_ov)
       {
         s_dbg_ov = mic_overruns;
@@ -1572,6 +1683,8 @@ static void lt_rx_task(void *argument)
       r.type = LT_MSG_DREQ;
       r.seq  = m.seq;
       r.pad[0] = (lt_ff_state >= 2U) ? LT_FLAG_FF_READY : 0U;
+      r.pad[1] = LT_TEMP_MODE_TAG;
+      r.t1   = lt_temp_state;  /* DREQ does not use t1 as a time stamp. */
       r.t2   = lt_t2;
       r.t3   = lt_t3;
       (void)lwip_sendto(lt_sock, &r, sizeof(r), 0U,
@@ -1605,7 +1718,10 @@ static void lt_rx_task(void *argument)
       memset(&r, 0, sizeof(r));
       r.type = LT_MSG_DRESP;
       r.seq  = m.seq;
+      r.pad[1] = LT_TEMP_MODE_TAG;
       r.t1   = lt_t1;
+      lt_temp_receive(&from, m.pad[1], m.t1);
+      r.t2   = lt_temp_state;  /* DRESP does not use t2 as a time stamp. */
       r.t4   = t_rx;
       r.dly_m = dly;
       r.off_m = off;      /* 把主板算出的偏移带给从板 */
@@ -1681,6 +1797,7 @@ static void lt_rx_task(void *argument)
       lt_dbg_t2  = lt_t2;
       lt_dbg_t3  = lt_t3;
       lt_dbg_t4  = m.t4;
+      lt_temp_receive(&from, m.pad[1], m.t2);
     }
     else if (m.type == LT_MSG_TOA)
     {

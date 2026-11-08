@@ -23,6 +23,12 @@ void disp_task(void *argument);  /* 轮询快照，仅在显示数据变化时�
 uint8_t lt_conv_display_snap(uint32_t *announce_ms);
 
 uint32_t disp_air_tx_snap(int32_t *temperature10);
+/* Shared temperature selection: preset index 0..4, or AUTO. */
+#define DISP_TEMP_COUNT 5u
+#define DISP_TEMP_AUTO  DISP_TEMP_COUNT
+void     lt_temp_select(uint8_t selection);
+uint8_t  lt_temp_selected(void);
+
 /* Selected sound speed in 0.001 m/s, or 0 when AUTO has no valid DHT11 sample. */
 uint32_t disp_measurement_speed_x1000(void);
 #endif /* __DISP_H__ */

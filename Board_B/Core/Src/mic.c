@@ -560,6 +560,7 @@ typedef struct
 {
   uint32_t local_seq[MIC_TDOA_RING], local_us[MIC_TDOA_RING];
   uint32_t local_speed[MIC_TDOA_RING];
+  mic_signal_quality_t local_quality[MIC_TDOA_RING];
   uint8_t local_count, local_next;
   uint32_t anchor_us;
   uint8_t anchor_valid;
@@ -578,6 +579,27 @@ typedef struct
 } mic_td_state_t;
 
 static mic_td_state_t mic_td_states[2];
+
+#define MIC_QUALITY_QUEUE_SIZE 8u
+static mic_pair_quality_t mic_quality_queue[MIC_QUALITY_QUEUE_SIZE];
+static uint8_t mic_quality_head, mic_quality_count;
+volatile uint32_t mic_tdoa_quality_dropped;
+
+uint8_t mic_tdoa_quality_pop(mic_pair_quality_t *result)
+{
+  uint8_t ready;
+
+  taskENTER_CRITICAL();
+  ready = (uint8_t)(mic_quality_count != 0u);
+  if (ready != 0u)
+  {
+    *result = mic_quality_queue[mic_quality_head];
+    mic_quality_head = (uint8_t)((mic_quality_head + 1u) % MIC_QUALITY_QUEUE_SIZE);
+    mic_quality_count--;
+  }
+  taskEXIT_CRITICAL();
+  return ready;
+}
 static uint8_t mic_td_active_kind;
 static uint32_t mic_td_display_from_seq;
 static uint8_t mic_have_clap;
@@ -586,7 +608,12 @@ volatile uint8_t mic_event_kind, mic_tdoa_kind;
 
 static mic_td_state_t *mic_td_state(uint8_t kind)
 {
-  return &mic_td_states[(kind == MIC_EVENT_CLAP) ? 1u : 0u];
+  switch (kind)
+  {
+    case MIC_EVENT_CHIRP: return &mic_td_states[0];
+    case MIC_EVENT_CLAP:  return &mic_td_states[1];
+    default:              return NULL;
+  }
 }
 
 volatile int32_t  mic_tdoa_us    = 0;         /* 最近一次配对成功的 TDOA */
@@ -613,12 +640,22 @@ static int32_t mic_td_corrected_us(uint32_t tl, uint32_t tp, uint8_t kind)
   return 0;
 }
 
-static void mic_td_commit(uint32_t lseq, uint32_t pseq, uint32_t tl, uint32_t tp,
-                          uint32_t speed_x1000, uint8_t kind)
+static void mic_td_commit(mic_td_state_t *state, uint8_t slot, uint32_t pseq,
+                          uint32_t tp, int32_t dt_us, uint8_t kind, uint8_t new_distance)
 {
-  mic_td_state_t *state = mic_td_state(kind);
+  uint32_t lseq = state->local_seq[slot];
+  uint32_t tl = state->local_us[slot];
+  uint32_t speed_x1000 = state->local_speed[slot];
   uint32_t i, n, mx = 0u;
-  int32_t  dt_us = mic_td_corrected_us(tl, tp, kind);
+  mic_pair_quality_t *quality;
+  uint32_t distance_mm = MIC_DISTANCE_UNAVAILABLE;
+
+  if (new_distance != 0u)
+  {
+    state->distance_count = 0u;
+    state->distance_mean = 0.0;
+    state->distance_m2 = 0.0;
+  }
 
   mic_tdoa_us      = dt_us;
   state->last_local_us  = tl;
@@ -637,22 +674,22 @@ static void mic_td_commit(uint32_t lseq, uint32_t pseq, uint32_t tl, uint32_t tp
     state->time_m2 += delta * (x - state->time_mean);
   }
 
-  state->distances_mm[state->history_next] = MIC_DISTANCE_UNAVAILABLE;
   if (speed_x1000 != 0u)
   {
     uint32_t magnitude_us = (uint32_t)((dt_us < 0) ? -dt_us : dt_us);
     uint64_t scaled = (uint64_t)magnitude_us * speed_x1000;
-    state->distances_mm[state->history_next] = (uint32_t)((scaled + 500000u) / 1000000u);
+    distance_mm = (uint32_t)((scaled + 500000u) / 1000000u);
     if (state->distance_count != UINT32_MAX)
     {
-      double distance_mm = (double)scaled / 1000000.0;
-      double delta = distance_mm - state->distance_mean;
+      double exact_mm = (double)scaled / 1000000.0;
+      double delta = exact_mm - state->distance_mean;
       state->distance_count++;
       state->distance_mean += delta / (double)state->distance_count;
-      state->distance_m2 += delta * (distance_mm - state->distance_mean);
+      state->distance_m2 += delta * (exact_mm - state->distance_mean);
     }
   }
 
+  state->distances_mm[state->history_next] = distance_mm;
   state->times_us[state->history_next] = (uint32_t)dt_us;
   state->history_next = (uint8_t)((state->history_next + 1u) % MIC_TDOA_STAT);
   if (state->history_count < MIC_TDOA_STAT) { state->history_count++; }
@@ -677,6 +714,24 @@ static void mic_td_commit(uint32_t lseq, uint32_t pseq, uint32_t tl, uint32_t tp
   mic_tdoa_dj_us = mx;
   mic_tdoa_kind = kind;
   mic_tdoa_pairs++;
+
+  if (mic_quality_count == MIC_QUALITY_QUEUE_SIZE)
+  {
+    mic_quality_head = (uint8_t)((mic_quality_head + 1u) % MIC_QUALITY_QUEUE_SIZE);
+    mic_quality_count--;
+    mic_tdoa_quality_dropped++;
+  }
+  quality = &mic_quality_queue[(mic_quality_head + mic_quality_count) % MIC_QUALITY_QUEUE_SIZE];
+  quality->pair_seq = mic_tdoa_pairs;
+  quality->local_seq = lseq;
+  quality->peer_seq = pseq;
+  quality->sd_count = state->distance_count;
+  quality->distance_mm = distance_mm;
+  quality->tdoa_us = dt_us;
+  quality->signal = state->local_quality[slot];
+  quality->kind = kind;
+  quality->new_distance = new_distance;
+  mic_quality_count++;
 }
 
 /* 两个 32 位微秒时刻的绝对差。先转成有符号再取绝对值，跨过 32 位
@@ -690,7 +745,14 @@ static uint32_t mic_td_absdiff(uint32_t a, uint32_t b)
 
 /* 最近最多 5 个已接受值的中位数作基准；跳变连续出现才视作声源换了位置。
    只筛除明显错峰/反射，不把亚厘米级波动伪装成 2 mm 精度。 */
-static uint8_t mic_td_stable(int32_t dt_us, uint8_t kind)
+typedef enum
+{
+  MIC_PAIR_REJECTED,
+  MIC_PAIR_ACCEPTED,
+  MIC_PAIR_NEW_DISTANCE
+} mic_pair_decision_t;
+
+static mic_pair_decision_t mic_td_stable(int32_t dt_us, uint8_t kind)
 {
   mic_td_state_t *state = mic_td_state(kind);
   uint32_t stable_us = (kind == MIC_EVENT_CLAP) ? MIC_CLAP_TDOA_STABLE_US : MIC_TDOA_STABLE_US;
@@ -700,9 +762,11 @@ static uint8_t mic_td_stable(int32_t dt_us, uint8_t kind)
   int32_t direction_min_us = (kind == MIC_EVENT_CLAP) ?
                              MIC_CLAP_DIRECTION_MIN_US : (int32_t)MIC_TDOA_STABLE_US;
   int32_t v[5], center, diff;
+  uint32_t magnitude_us, center_us;
+  mic_pair_decision_t new_position;
   uint8_t i, j, n = state->position_count;
 
-  if (n == 0u) { return 1u; }
+  if (n == 0u) { return MIC_PAIR_ACCEPTED; }
   for (i = 0u; i < n; i++)
   {
     uint8_t k = (uint8_t)((state->history_next + MIC_TDOA_STAT - 1u - i) % MIC_TDOA_STAT);
@@ -720,6 +784,12 @@ static uint8_t mic_td_stable(int32_t dt_us, uint8_t kind)
     v[j] = x;
   }
   center = v[n / 2u];
+  /* The displayed distance uses the magnitude. A reversal at the same
+     path difference starts a new direction reference but keeps its SD. */
+  magnitude_us = (uint32_t)((dt_us < 0) ? -dt_us : dt_us);
+  center_us = (uint32_t)((center < 0) ? -center : center);
+  new_position = (mic_td_absdiff(magnitude_us, center_us) > stable_us) ?
+                 MIC_PAIR_NEW_DISTANCE : MIC_PAIR_ACCEPTED;
   if (((center >= direction_min_us) && (dt_us <= -direction_min_us)) ||
       ((center <= -direction_min_us) && (dt_us >= direction_min_us)))
   {
@@ -727,7 +797,7 @@ static uint8_t mic_td_stable(int32_t dt_us, uint8_t kind)
        Keep displayed measurements; the next reference starts at this pair. */
     state->new_count = 0u;
     state->position_count = 0u;
-    return 1u;
+    return new_position;
   }
 
   diff = dt_us - center;
@@ -735,7 +805,7 @@ static uint8_t mic_td_stable(int32_t dt_us, uint8_t kind)
   if ((uint32_t)diff <= stable_us)
   {
     state->new_count = 0u;
-    return 1u;
+    return MIC_PAIR_ACCEPTED;
   }
 
   diff = dt_us - state->new_center_us;
@@ -754,7 +824,7 @@ static uint8_t mic_td_stable(int32_t dt_us, uint8_t kind)
   if (state->new_count < MIC_TDOA_NEW_COUNT)
   {
     mic_td_rej_jump++;
-    return 0u;
+    return MIC_PAIR_REJECTED;
   }
 
   state->new_count = 0u;
@@ -762,39 +832,47 @@ static uint8_t mic_td_stable(int32_t dt_us, uint8_t kind)
   state->history_count = 0u;
   state->history_next = 0u;
   state->dj_us = 0u;
-  return 1u;
+  return new_position;
 }
 
 /* 试配一对：窗口内 + 差值不超过物理上限，才承认 */
-static uint8_t mic_td_try(uint32_t lseq, uint32_t tl, uint32_t pseq, uint32_t tp,
-                         uint32_t speed_x1000, uint8_t kind)
+static void mic_td_try(uint8_t slot, uint32_t pseq, uint32_t tp, uint8_t kind)
 {
   mic_td_state_t *state = mic_td_state(kind);
+  uint32_t tl = state->local_us[slot];
   uint32_t d = mic_td_absdiff(tl, tp);
+  int32_t dt_us;
+  mic_pair_decision_t decision;
 
   if (d > MIC_TDOA_VALID_US)
   {
     if (d <= MIC_TDOA_DIAG_US) { mic_td_rej_far++; }
-    return 0u;
+    return;
   }
 
-  if (mic_td_stable(mic_td_corrected_us(tl, tp, kind), kind) == 0u)
+  dt_us = mic_td_corrected_us(tl, tp, kind);
+  decision = mic_td_stable(dt_us, kind);
+  if (decision == MIC_PAIR_REJECTED)
   {
     /* 被拒绝的一对也记为已处理，避免重复 UDP 报文把一次坏值算作多次新位置。 */
-    state->used_local_seq = lseq;
+    state->used_local_seq = state->local_seq[slot];
     state->used_peer_seq = pseq;
-    return 0u;
+    return;
   }
 
-  mic_td_commit(lseq, pseq, tl, tp, speed_x1000, kind);
-  return 1u;
+  mic_td_commit(state, slot, pseq, tp, dt_us, kind, (uint8_t)(decision == MIC_PAIR_NEW_DISTANCE));
 }
 
 /* Publish a classified event in its own matching ring. */
-static void mic_td_local(uint32_t seq, uint32_t t_us, uint32_t speed_x1000, uint8_t kind, uint8_t anchor)
+static void mic_td_local(uint32_t seq, uint32_t t_us, uint32_t speed_x1000, uint8_t kind,
+                         uint8_t anchor, const mic_signal_quality_t *quality)
 {
   mic_td_state_t *state = mic_td_state(kind);
+  uint8_t slot;
+
+  if (state == NULL) { return; }
   taskENTER_CRITICAL();
+  slot = state->local_next;
   if (mic_td_active_kind != kind)
   {
     mic_td_display_from_seq = seq;
@@ -806,16 +884,17 @@ static void mic_td_local(uint32_t seq, uint32_t t_us, uint32_t speed_x1000, uint
     state->anchor_us = t_us;
     state->anchor_valid = 1u;
   }
-  state->local_seq[state->local_next] = seq;
-  state->local_us [state->local_next] = t_us;
-  state->local_speed[state->local_next] = speed_x1000;
-  state->local_next = (uint8_t)((state->local_next + 1u) % MIC_TDOA_RING);
+  state->local_seq[slot] = seq;
+  state->local_us [slot] = t_us;
+  state->local_speed[slot] = speed_x1000;
+  state->local_quality[slot] = *quality;
+  state->local_next = (uint8_t)((slot + 1u) % MIC_TDOA_RING);
   if (state->local_count < MIC_TDOA_RING) { state->local_count++; }
 
   /* 对方的报文先到了：这一拍把另一半补上 */
   if ((state->peer_pending != 0u) && (state->peer_seq != state->used_peer_seq))
   {
-    (void)mic_td_try(seq, t_us, state->peer_seq, state->peer_us, speed_x1000, kind);
+    mic_td_try(slot, state->peer_seq, state->peer_us, kind);
     /* An out-of-range peak must leave the peer report available for replay. */
     if (state->peer_seq == state->used_peer_seq) { state->peer_pending = 0u; }
   }
@@ -833,7 +912,7 @@ uint8_t mic_tdoa_tx_snap(uint32_t *seq, uint32_t *t_us, uint8_t *kind)
   taskENTER_CRITICAL();
   *kind = mic_td_active_kind;
   state = mic_td_state(*kind);
-  if (state->local_count != 0u)
+  if ((state != NULL) && (state->local_count != 0u))
   {
     uint8_t j = (uint8_t)((state->local_next + MIC_TDOA_RING - 1u) % MIC_TDOA_RING);
 
@@ -853,21 +932,9 @@ double mic_tdoa_all_sample_variance_us2(uint32_t *count)
   const mic_td_state_t *state;
   taskENTER_CRITICAL();
   state = mic_td_state(mic_td_active_kind);
-  *count = state->time_count;
-  variance = (state->time_count >= 2u) ?
+  *count = (state != NULL) ? state->time_count : 0u;
+  variance = (*count >= 2u) ?
              state->time_m2 / (double)(state->time_count - 1u) : 0.0;
-  taskEXIT_CRITICAL();
-  return variance;
-}
-
-double mic_tdoa_all_sample_variance_mm2(uint8_t kind, uint32_t *count)
-{
-  double variance;
-  const mic_td_state_t *state = mic_td_state(kind);
-  taskENTER_CRITICAL();
-  *count = state->distance_count;
-  variance = (state->distance_count >= 2u) ?
-             state->distance_m2 / (double)(state->distance_count - 1u) : 0.0;
   taskEXIT_CRITICAL();
   return variance;
 }
@@ -875,7 +942,8 @@ double mic_tdoa_all_sample_variance_mm2(uint8_t kind, uint32_t *count)
 uint8_t mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
                               int32_t *dt, uint32_t *distance_mm,
                               uint32_t *history_mm, uint8_t cap,
-                              uint8_t *count, uint32_t *dj_us, uint8_t *kind)
+                              uint8_t *count, uint32_t *dj_us, uint8_t *kind,
+                              uint32_t *sd_count, double *variance_mm2)
 {
   uint8_t i, n, paired;
   const mic_td_state_t *state;
@@ -883,19 +951,26 @@ uint8_t mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
   taskENTER_CRITICAL();
   *kind = mic_td_active_kind;
   state = mic_td_state(*kind);
-  /* A result from before the latest type switch must not reappear. */
-  paired = (uint8_t)((*kind != MIC_EVENT_NONE) && (state->history_count != 0u) &&
+  /* The distance and SD come from the same kind and visible pair. */
+  paired = (uint8_t)((state != NULL) && (state->history_count != 0u) &&
                     ((int32_t)(state->last_pair_seq - mic_td_display_from_seq) >= 0));
-  n = state->history_count;
-  if (n > MIC_TDOA_STAT) { n = MIC_TDOA_STAT; }
-  if (n > cap) { n = cap; }
+  *sd_count = 0u;
+  *variance_mm2 = 0.0;
   if (paired != 0u)
   {
+    n = state->history_count;
+    if (n > MIC_TDOA_STAT) { n = MIC_TDOA_STAT; }
+    if (n > cap) { n = cap; }
     *local_us = state->last_local_us;
     *peer_us = state->last_peer_us;
     *dt = state->last_diff_us;
     *distance_mm = state->distances_mm[(state->history_next + MIC_TDOA_STAT - 1u) % MIC_TDOA_STAT];
     *dj_us = state->dj_us;
+    *sd_count = state->distance_count;
+    if (*sd_count >= 2u)
+    {
+      *variance_mm2 = state->distance_m2 / (double)(*sd_count - 1u);
+    }
     for (i = 0u; i < n; i++)
     {
       uint8_t k = (uint8_t)((state->history_next + MIC_TDOA_STAT + i - n) % MIC_TDOA_STAT);
@@ -945,7 +1020,7 @@ void mic_tdoa_rx(uint32_t seq, uint32_t t_us, uint32_t kind)
 
     if (best != 0xFFu)
     {
-      (void)mic_td_try(state->local_seq[best], state->local_us[best], seq, t_us, state->local_speed[best], (uint8_t)kind);
+      mic_td_try(best, seq, t_us, (uint8_t)kind);
       state->peer_pending = 0u;      /* 这条报文已经处理过，不再留给下一拍 */
     }
     else
@@ -1016,7 +1091,8 @@ static void mic_prepare_toa(mic_toa_candidate_t *event, uint32_t pos256, uint32_
   event->time_us = event->raw_us - (uint32_t)event->sync_offset_us;
 }
 
-static void mic_publish_toa(const mic_toa_candidate_t *event, uint8_t kind)
+static void mic_publish_toa(const mic_toa_candidate_t *event, uint8_t kind,
+                            const mic_signal_quality_t *quality)
 {
   uint8_t anchor = (uint8_t)((kind == MIC_EVENT_CHIRP) && (mic_pend_from_peer == 0u) &&
                              (event->correlation_q >= MIC_CHIRP_ANCHOR_Q));
@@ -1032,7 +1108,7 @@ static void mic_publish_toa(const mic_toa_candidate_t *event, uint8_t kind)
   mic_event_phase_end_us = event->phase_end_us;
   mic_event_kind = kind;
   mic_event_seq++;
-  mic_td_local(mic_event_seq, event->time_us, event->speed_x1000, kind, anchor);
+  mic_td_local(mic_event_seq, event->time_us, event->speed_x1000, kind, anchor, quality);
   mic_last_pk = event->peak;
   mic_last_corr_q = event->correlation_q;
 }
@@ -1105,6 +1181,27 @@ static uint8_t mic_chirp_match_peer(int32_t start_diff_us, uint32_t *pos256, flo
   return 1u;
 }
 
+/* Amplitude metrics use the 50 ms window selected by the correlator.
+   Both regular and replay captures are measured on the same 24 kHz grid. */
+static void mic_chirp_quality(mic_signal_quality_t *quality, uint32_t pos256, uint8_t replay)
+{
+  uint32_t i, start = pos256 / 256u;
+  float low = mic_chirp_x[start], high = low;
+  float gate = (replay != 0u) ? MIC_CHIRP_PEER_MIN_R : MIC_CHIRP_MIN_R;
+
+  for (i = start + 1u; i < start + MIC_CHIRP_REF_N; ++i)
+  {
+    float sample = mic_chirp_x[i];
+    if (sample < low) { low = sample; }
+    if (sample > high) { high = sample; }
+  }
+  quality->chirp.rq = (uint16_t)mic_match_best_q;
+  quality->chirp.gate = (uint16_t)(gate * 1000.0f + 0.5f);
+  quality->chirp.rms10 = (uint16_t)(sqrtf(mic_chirp_energy[start] / (float)MIC_CHIRP_REF_N) * 10.0f + 0.5f);
+  quality->chirp.pp10 = (uint16_t)((high - low) * 10.0f + 0.5f);
+  quality->chirp.replay = replay;
+}
+
 static void mic_finalize_peer_chirp(void)
 {
   uint32_t i, pos256;
@@ -1113,6 +1210,7 @@ static void mic_finalize_peer_chirp(void)
   uint8_t matched;
   uint64_t t_calc = lt_now_cnt();
   mic_toa_candidate_t event;
+  mic_signal_quality_t quality = {0};
   const mic_td_state_t *state;
 
   for (i = 0u; i < MIC_PEER_WINDOW_SAMPLES; ++i)
@@ -1129,6 +1227,7 @@ static void mic_finalize_peer_chirp(void)
 
   mic_prepare_toa(&event, pos256, mic_pend_pk);
   if (mic_td_absdiff(event.time_us, mic_pend_peer_us) > MIC_TDOA_VALID_US) { return; }
+  mic_chirp_quality(&quality, pos256, 1u);
 
   taskENTER_CRITICAL();
   state = mic_td_state(MIC_EVENT_CHIRP);
@@ -1136,7 +1235,7 @@ static void mic_finalize_peer_chirp(void)
       (state->peer_us == mic_pend_peer_us) && (state->used_peer_seq != mic_pend_peer_seq))
   {
     mic_weak_chirp_cnt++;
-    mic_publish_toa(&event, MIC_EVENT_CHIRP);
+    mic_publish_toa(&event, MIC_EVENT_CHIRP, &quality);
   }
   taskEXIT_CRITICAL();
 }
@@ -1151,6 +1250,7 @@ static void mic_finalize(void)
   uint8_t  chirp_ok, clap_ok;
   mic_clap_result_t clap;
   mic_toa_candidate_t event;
+  mic_signal_quality_t quality = {0};
 
   if (mic_pend_n < (uint16_t)(MIC_CHIRP_REF_N * MIC_CHIRP_DECIM))
   {
@@ -1185,8 +1285,21 @@ static void mic_finalize(void)
   mic_match_best_q = (uint32_t)((rr * 1000.0f) + 0.5f);
   if (kind != MIC_EVENT_NONE)
   {
+    if (kind == MIC_EVENT_CHIRP)
+    {
+      mic_chirp_quality(&quality, pos256, 0u);
+    }
+    else
+    {
+      quality.clap.peak = (uint16_t)clap.peak;
+      quality.clap.noise = (uint16_t)clap.noise;
+      quality.clap.rise_us = (uint16_t)clap.rise_us;
+      quality.clap.width_us = (uint16_t)clap.width_us;
+      quality.clap.early_percent = (uint8_t)clap.early_percent;
+      quality.clap.clipped = (uint16_t)clap.clipped;
+    }
     mic_prepare_toa(&event, pos256, pk);
-    mic_publish_toa(&event, kind);
+    mic_publish_toa(&event, kind, &quality);
   }
 }
 

@@ -83,12 +83,30 @@ extern volatile uint8_t  mic_tpl_valid;    /* V6.0.2 固定 1（chirp 参考就�
 uint8_t  mic_tdoa_tx_snap(uint32_t *seq, uint32_t *t_us, uint8_t *kind);
 /* 屏幕用的一致快照：同一次临界区读取最近配对及最近 10 次差值。 */
 #define MIC_DISTANCE_UNAVAILABLE UINT32_MAX
-double   mic_tdoa_all_sample_variance_mm2(uint8_t kind, uint32_t *count);
 uint8_t  mic_tdoa_display_snap(uint32_t *local_us, uint32_t *peer_us,
                                int32_t *dt, uint32_t *distance_mm,
                               uint32_t *history_mm, uint8_t cap,
-                               uint8_t *count, uint32_t *dj_us, uint8_t *kind);
+                               uint8_t *count, uint32_t *dj_us, uint8_t *kind,
+                               uint32_t *sd_count, double *variance_mm2);
 void     mic_tdoa_rx(uint32_t seq, uint32_t t_us, uint32_t kind);
+
+typedef union
+{
+  struct { uint16_t rq, gate, rms10, pp10; uint8_t replay; } chirp;
+  struct { uint16_t peak, noise, rise_us, width_us, clipped; uint8_t early_percent; } clap;
+} mic_signal_quality_t;
+
+typedef struct
+{
+  uint32_t pair_seq, local_seq, peer_seq, sd_count;
+  uint32_t distance_mm;
+  int32_t tdoa_us;  /* Calibrated local-minus-peer time difference. */
+  mic_signal_quality_t signal;
+  uint8_t kind, new_distance;
+} mic_pair_quality_t;
+
+uint8_t  mic_tdoa_quality_pop(mic_pair_quality_t *result);
+extern volatile uint32_t mic_tdoa_quality_dropped;
 
 /* 链路诊断 */
 extern volatile uint32_t mic_overruns;     /* 任务没赶上、被 DMA 覆盖的半缓冲数 */

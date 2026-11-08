@@ -92,13 +92,13 @@ static void dht11_draw(void)
   if (disp_auto_temp == 0u)
   {
     (void)snprintf(text, sizeof(text), "Used:%+dC", (int)disp_temp_c[disp_temp_sel]);
-    disp_fill(311,122,467,139,C_PANEL);
-    (void)disp_str(313,123,text,C_ACC,1);
+    disp_fill(311,125,467,141,C_PANEL);
+    (void)disp_str(313,126,text,C_ACC,1);
     return;
   }
   if (dht_valid) {(void)snprintf(text,sizeof(text),"Temp:%s%u.%uC",temp10<0?"-":"",mag/10u,mag%10u);}
   else {(void)snprintf(text,sizeof(text),"%s",errors[dht_error<8u?dht_error:2u]);}
-  disp_fill(311,122,467,139,C_PANEL); (void)disp_str(313,123,text,dht_valid?C_ACC:C_WARN,1);
+  disp_fill(311,125,467,141,C_PANEL); (void)disp_str(313,126,text,dht_valid?C_ACC:C_WARN,1);
 }
 static void dht11_report(void)
 {
