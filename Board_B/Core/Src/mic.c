@@ -545,11 +545,11 @@ static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out, uint32_t n,
 #define MIC_TDOA_NEW_US     60u  /* 新位置连续候选的相互容差，约 2.1 cm */
 #define MIC_TDOA_NEW_COUNT   3u  /* 连续 3 次才切换位置，单次反射不污染历史 */
 
-/* 205.7 cm end-on calibration, ~346 m/s. The two usable groups averaged
-   -5954/+5986 us on A after the old 2 us magnitude correction.
-   Remove 16 us of signed A-minus-B bias, then 26 us of range bias. */
-#define MIC_CHIRP_LOCAL_BIAS_US (-16)
-#define MIC_CHIRP_RANGE_BIAS_US 26
+/* 202.7 cm calibration with the source outside each end of the baseline.
+   A-side mean: 201.94 cm at 21.7 C; B-side mean: 201.55 cm at 21.4 C.
+   Remove the signed local bias, then subtract the range bias from the magnitude. */
+#define MIC_CHIRP_LOCAL_BIAS_US (-10)
+#define MIC_CHIRP_RANGE_BIAS_US (-2)
 
 #define MIC_CLAP_TDOA_STABLE_US 800u
 #define MIC_CLAP_TDOA_NEW_US    400u
@@ -602,8 +602,14 @@ static int32_t mic_td_corrected_us(uint32_t tl, uint32_t tp, uint8_t kind)
   if (kind != MIC_EVENT_CHIRP) { return dt_raw; }
 
   dt_raw -= MIC_CHIRP_LOCAL_BIAS_US;
-  if (dt_raw > MIC_CHIRP_RANGE_BIAS_US) { return dt_raw - MIC_CHIRP_RANGE_BIAS_US; }
-  if (dt_raw < -MIC_CHIRP_RANGE_BIAS_US) { return dt_raw + MIC_CHIRP_RANGE_BIAS_US; }
+  if (dt_raw > 0)
+  {
+    return (dt_raw > MIC_CHIRP_RANGE_BIAS_US) ? dt_raw - MIC_CHIRP_RANGE_BIAS_US : 0;
+  }
+  if (dt_raw < 0)
+  {
+    return (dt_raw < -MIC_CHIRP_RANGE_BIAS_US) ? dt_raw + MIC_CHIRP_RANGE_BIAS_US : 0;
+  }
   return 0;
 }
 
