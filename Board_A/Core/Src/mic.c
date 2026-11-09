@@ -550,8 +550,13 @@ static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out, uint32_t n,
 /* 202.7 cm calibration with the source outside each end of the baseline.
    A-side mean: 201.94 cm at 21.7 C; B-side mean: 201.55 cm at 21.4 C.
    Remove the signed local bias, then subtract the range bias from the magnitude. */
-#define MIC_CHIRP_LOCAL_BIAS_US (10)
-#define MIC_CHIRP_RANGE_BIAS_US (-2)
+#define MIC_CHIRP_LOCAL_BIAS_US (3)
+#define MIC_CHIRP_RANGE_BIAS_US (-9)
+#define MIC_CHIRP_LOCAL_SIGN (1)
+
+static mic_chirp_cal_t mic_chirp_cal = {
+  MIC_CHIRP_LOCAL_SIGN * MIC_CHIRP_LOCAL_BIAS_US, MIC_CHIRP_RANGE_BIAS_US
+};
 
 #define MIC_CLAP_TDOA_STABLE_US 800u
 #define MIC_CLAP_TDOA_NEW_US    400u
@@ -624,20 +629,46 @@ volatile uint32_t mic_tdoa_pairs = 0u;        /* 配对成功次数（累计） 
 volatile uint32_t mic_tdoa_rxn   = 0u;        /* 收到对方报文条数（累计） */
 volatile uint32_t mic_td_rej_jump = 0u;       /* 与稳定位置不符而丢弃的配对 */
 
+void mic_chirp_cal_get(mic_chirp_cal_t *cal)
+{
+  taskENTER_CRITICAL();
+  *cal = mic_chirp_cal;
+  taskEXIT_CRITICAL();
+}
+
+void mic_chirp_cal_apply(const mic_chirp_cal_t *cal)
+{
+  taskENTER_CRITICAL();
+  if ((cal->ab_bias_us != mic_chirp_cal.ab_bias_us) ||
+      (cal->range_bias_us != mic_chirp_cal.range_bias_us))
+  {
+    mic_td_state_t *chirp = mic_td_state(MIC_EVENT_CHIRP);
+    uint32_t used_peer_seq = chirp->used_peer_seq;
+
+    mic_chirp_cal = *cal;
+    /* Start a fresh CHIRP history and SD under the new calibration. */
+    (void)memset(chirp, 0, sizeof(*chirp));
+    chirp->used_peer_seq = used_peer_seq;
+  }
+  taskEXIT_CRITICAL();
+}
+
 /* Wrapped subtraction gives the signed local-minus-peer difference. */
 static int32_t mic_td_corrected_us(uint32_t tl, uint32_t tp, uint8_t kind)
 {
   int32_t dt_raw = (int32_t)(tl - tp);
+  int32_t range_bias;
   if (kind != MIC_EVENT_CHIRP) { return dt_raw; }
 
-  dt_raw -= MIC_CHIRP_LOCAL_BIAS_US;
+  dt_raw -= MIC_CHIRP_LOCAL_SIGN * mic_chirp_cal.ab_bias_us;
+  range_bias = mic_chirp_cal.range_bias_us;
   if (dt_raw > 0)
   {
-    return (dt_raw > MIC_CHIRP_RANGE_BIAS_US) ? dt_raw - MIC_CHIRP_RANGE_BIAS_US : 0;
+    return (dt_raw > range_bias) ? dt_raw - range_bias : 0;
   }
   if (dt_raw < 0)
   {
-    return (dt_raw < -MIC_CHIRP_RANGE_BIAS_US) ? dt_raw + MIC_CHIRP_RANGE_BIAS_US : 0;
+    return (dt_raw < -range_bias) ? dt_raw + range_bias : 0;
   }
   return 0;
 }

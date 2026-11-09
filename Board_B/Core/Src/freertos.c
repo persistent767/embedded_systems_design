@@ -93,6 +93,11 @@ uint8_t lt_air_display_snap(int32_t *t,uint32_t *speed)
 #define LT_TEMP_OPTION_MASK 0x07U
 #define LT_TEMP_MASTER_BIT  0x08U
 #define LT_TEMP_VERSION_STEP 0x10U
+#define LT_CHIRP_CAL_TAG        0x43u
+#define LT_CHIRP_CAL_REV_MASK   0xfffe0000u
+#define LT_CHIRP_CAL_REV_STEP   0x00020000u
+#define LT_CHIRP_CAL_MASTER_BIT 0x00010000u
+#define LT_CHIRP_CAL_VALUE_MASK 0x0000ffffu
 #define LT_FLAG_FF_READY    0x01U   /* DREQ.pad[0]：从板频率预标定已结束 */
 #define LT_DLY_ACCEPT_US    20U
 #define LT_DLY_RECENT_MS    2000U   /* V5.8：dly 地板只统计最近 2 秒的样本。
@@ -560,6 +565,82 @@ static void lt_temp_receive(const struct sockaddr_in *from, uint8_t tag, uint32_
   else if (newer != 0u)
   {
     lt_temp_state = incoming;
+  }
+  taskEXIT_CRITICAL();
+}
+
+/* One word carries both signed values, a revision and the writer role.
+   A zero word represents the firmware defaults before the first edit. */
+static volatile uint32_t lt_chirp_cal_state;
+static uint8_t lt_chirp_cal_peer_seen, lt_chirp_cal_pending_initial;
+
+static uint32_t lt_chirp_cal_next(uint32_t base, uint32_t values)
+{
+  uint32_t revision = (base & LT_CHIRP_CAL_REV_MASK) + LT_CHIRP_CAL_REV_STEP;
+
+  if (revision == 0u) { revision = LT_CHIRP_CAL_REV_STEP; }
+  return revision | ((lt_is_master != 0u) ? LT_CHIRP_CAL_MASTER_BIT : 0u) | values;
+}
+
+static uint8_t lt_chirp_cal_valid(const mic_chirp_cal_t *cal)
+{
+  return (uint8_t)((cal->ab_bias_us >= -MIC_CHIRP_CAL_LIMIT_US) &&
+                   (cal->ab_bias_us <= MIC_CHIRP_CAL_LIMIT_US) &&
+                   (cal->range_bias_us >= -MIC_CHIRP_CAL_LIMIT_US) &&
+                   (cal->range_bias_us <= MIC_CHIRP_CAL_LIMIT_US));
+}
+
+void lt_chirp_cal_set(const mic_chirp_cal_t *cal)
+{
+  uint32_t values;
+
+  if (lt_chirp_cal_valid(cal) == 0u) { return; }
+  values = ((uint32_t)(cal->ab_bias_us + MIC_CHIRP_CAL_LIMIT_US) << 8) |
+           (uint32_t)(cal->range_bias_us + MIC_CHIRP_CAL_LIMIT_US);
+
+  taskENTER_CRITICAL();
+  mic_chirp_cal_apply(cal);
+  lt_chirp_cal_state = lt_chirp_cal_next(lt_chirp_cal_state, values);
+  if (lt_chirp_cal_peer_seen == 0u) { lt_chirp_cal_pending_initial = 1u; }
+  taskEXIT_CRITICAL();
+}
+
+static void lt_chirp_cal_receive(const struct sockaddr_in *from, uint8_t tag, uint32_t incoming)
+{
+  mic_chirp_cal_t cal;
+  uint32_t current;
+  uint8_t newer;
+
+  if ((tag != LT_CHIRP_CAL_TAG) || (from->sin_addr.s_addr != lt_peer.sin_addr.s_addr) ||
+      (from->sin_port != lt_peer.sin_port)) { return; }
+
+  if ((lt_chirp_cal_peer_seen != 0u) && (incoming == lt_chirp_cal_state)) { return; }
+
+  cal.ab_bias_us = (int32_t)((incoming >> 8) & 0xffu) - MIC_CHIRP_CAL_LIMIT_US;
+  cal.range_bias_us = (int32_t)(incoming & 0xffu) - MIC_CHIRP_CAL_LIMIT_US;
+  if ((incoming != 0u) &&
+      (((incoming & LT_CHIRP_CAL_REV_MASK) == 0u) || (lt_chirp_cal_valid(&cal) == 0u)))
+  {
+    return;
+  }
+
+  taskENTER_CRITICAL();
+  current = lt_chirp_cal_state;
+  newer = (uint8_t)((incoming != 0u) && ((current == 0u) || ((int32_t)(incoming - current) > 0)));
+  lt_chirp_cal_peer_seen = 1u;
+  if (lt_chirp_cal_pending_initial != 0u)
+  {
+    /* Keep a local edit made before reconnecting to a board with a newer revision. */
+    if (newer != 0u)
+    {
+      lt_chirp_cal_state = lt_chirp_cal_next(incoming, current & LT_CHIRP_CAL_VALUE_MASK);
+    }
+    lt_chirp_cal_pending_initial = 0u;
+  }
+  else if (newer != 0u)
+  {
+    mic_chirp_cal_apply(&cal);
+    lt_chirp_cal_state = incoming;
   }
   taskEXIT_CRITICAL();
 }
@@ -1678,6 +1759,8 @@ static void lt_rx_task(void *argument)
       r.t1   = lt_temp_state;  /* DREQ does not use t1 as a time stamp. */
       r.t2   = lt_t2;
       r.t3   = lt_t3;
+      r.pad[2] = LT_CHIRP_CAL_TAG;
+      r.t4   = lt_chirp_cal_state;  /* DREQ does not carry a t4 timestamp. */
       (void)lwip_sendto(lt_sock, &r, sizeof(r), 0U,
                         (struct sockaddr *)&from, sizeof(from));
     }
@@ -1713,11 +1796,14 @@ static void lt_rx_task(void *argument)
       r.t1   = lt_t1;
       lt_temp_receive(&from, m.pad[1], m.t1);
       r.t2   = lt_temp_state;  /* DRESP does not use t2 as a time stamp. */
+      r.pad[2] = LT_CHIRP_CAL_TAG;
+      r.t3   = lt_chirp_cal_state;  /* DRESP does not carry a t3 timestamp. */
       r.t4   = t_rx;
       r.dly_m = dly;
       r.off_m = off;      /* 把主板算出的偏移带给从板 */
       (void)lwip_sendto(lt_sock, &r, sizeof(r), 0U,
                         (struct sockaddr *)&from, sizeof(from));
+      lt_chirp_cal_receive(&from, m.pad[2], m.t4);
     }
     else if (m.type == LT_MSG_DRESP)
     {
@@ -1789,6 +1875,7 @@ static void lt_rx_task(void *argument)
       lt_dbg_t3  = lt_t3;
       lt_dbg_t4  = m.t4;
       lt_temp_receive(&from, m.pad[1], m.t2);
+      lt_chirp_cal_receive(&from, m.pad[2], m.t3);
     }
     else if (m.type == 5u)
     {

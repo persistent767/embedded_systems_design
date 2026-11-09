@@ -34,12 +34,32 @@ typedef enum
 {
   DISP_TEMP_CLOSED,
   DISP_TEMP_MODE,
-  DISP_TEMP_PRESET
+  DISP_TEMP_PRESET,
+  DISP_CHIRP_CAL
 } disp_temp_menu_t;
 
 static volatile uint8_t disp_temp_sel = 2u;
 static disp_temp_menu_t disp_temp_menu = DISP_TEMP_CLOSED;
 static volatile uint8_t disp_auto_temp = 1u;
+static mic_chirp_cal_t disp_cal_draft;
+static uint8_t disp_cal_dirty;
+
+#define DISP_TEMP_X1 148
+#define DISP_CAL_X0  152
+#define DISP_CAL_X1  195
+#define DISP_CAL_AB_Y 159
+#define DISP_CAL_RANGE_Y 193
+#define DISP_CAL_ROW_H 31
+#define DISP_CAL_MINUS_X0 295
+#define DISP_CAL_MINUS_X1 341
+#define DISP_CAL_PLUS_X0 351
+#define DISP_CAL_PLUS_X1 397
+#define DISP_CAL_ACTION_Y0 229
+#define DISP_CAL_ACTION_Y1 256
+#define DISP_CAL_CANCEL_X0 72
+#define DISP_CAL_CANCEL_X1 207
+#define DISP_CAL_APPLY_X0 247
+#define DISP_CAL_APPLY_X1 406
 static uint32_t disp_temp_snapshot(int32_t *temperature10);
 /* B 板触摸诊断：0=等待探测，1=正常，2=I2C 错误，3=芯片 ID 不符。 */
 static uint8_t disp_ts_status = 0u, disp_ts_seen = 0u;
@@ -252,7 +272,7 @@ static void disp_temp_button(void)
   int32_t t = 0;
   uint32_t speed = disp_temp_snapshot(&t);
 
-  disp_fill(12, 3, 195, 32, C_GRID);
+  disp_fill(12, 3, DISP_TEMP_X1, 32, C_GRID);
   if (speed == 0u)
   {
     (void)snprintf(b, sizeof(b), "AUTO WAIT");
@@ -267,6 +287,73 @@ static void disp_temp_button(void)
     (void)snprintf(b, sizeof(b), "SET %+dC", (int)(t / 10));
   }
   (void)disp_str(22, 10, b, C_TEXT, 1);
+}
+
+static void disp_cal_row(int32_t y, const char *label, int32_t value)
+{
+  char b[12];
+
+  (void)snprintf(b, sizeof(b), "%+ld", (long)value);
+  (void)disp_str(72, y + 8, label, C_TEXT, 1);
+  (void)disp_str(217, y + 8, b, C_ACC, 1);
+  disp_fill(DISP_CAL_MINUS_X0, y, DISP_CAL_MINUS_X1, y + DISP_CAL_ROW_H - 1, C_GRID);
+  disp_fill(DISP_CAL_PLUS_X0, y, DISP_CAL_PLUS_X1, y + DISP_CAL_ROW_H - 1, C_GRID);
+  (void)disp_str(313, y + 8, "-", C_TEXT, 1);
+  (void)disp_str(369, y + 8, "+", C_TEXT, 1);
+}
+
+static void disp_cal_popup(void)
+{
+  disp_fill(45, 124, 435, 264, C_BG);
+  disp_fill(51, 130, 429, 260, C_PANEL);
+  (void)disp_str(72, 136, "CHIRP CAL (us)", C_TEXT, 1);
+  disp_cal_row(DISP_CAL_AB_Y, "A-B BIAS", disp_cal_draft.ab_bias_us);
+  disp_cal_row(DISP_CAL_RANGE_Y, "RANGE BIAS", disp_cal_draft.range_bias_us);
+  disp_fill(DISP_CAL_CANCEL_X0, DISP_CAL_ACTION_Y0, DISP_CAL_CANCEL_X1, DISP_CAL_ACTION_Y1, C_GRID);
+  disp_fill(DISP_CAL_APPLY_X0, DISP_CAL_ACTION_Y0, DISP_CAL_APPLY_X1, DISP_CAL_ACTION_Y1, C_ACC);
+  (void)disp_str(106, 235, "CANCEL", C_TEXT, 1);
+  (void)disp_str(299, 235, "APPLY", C_BG, 1);
+  disp_cal_dirty = 0u;
+}
+
+static void disp_cal_touch(uint16_t x, uint16_t y)
+{
+  int32_t *value;
+  int32_t step;
+
+  if ((y >= DISP_CAL_ACTION_Y0) && (y <= DISP_CAL_ACTION_Y1))
+  {
+    if ((x >= DISP_CAL_APPLY_X0) && (x <= DISP_CAL_APPLY_X1))
+    {
+      lt_chirp_cal_set(&disp_cal_draft);
+      disp_temp_menu = DISP_TEMP_CLOSED;
+    }
+    else if ((x >= DISP_CAL_CANCEL_X0) && (x <= DISP_CAL_CANCEL_X1))
+    {
+      disp_temp_menu = DISP_TEMP_CLOSED;
+    }
+    return;
+  }
+
+  if ((y >= DISP_CAL_AB_Y) && (y < DISP_CAL_AB_Y + DISP_CAL_ROW_H))
+  {
+    value = &disp_cal_draft.ab_bias_us;
+  }
+  else if ((y >= DISP_CAL_RANGE_Y) && (y < DISP_CAL_RANGE_Y + DISP_CAL_ROW_H))
+  {
+    value = &disp_cal_draft.range_bias_us;
+  }
+  else { return; }
+
+  if ((x >= DISP_CAL_MINUS_X0) && (x <= DISP_CAL_MINUS_X1)) { step = -1; }
+  else if ((x >= DISP_CAL_PLUS_X0) && (x <= DISP_CAL_PLUS_X1)) { step = 1; }
+  else { return; }
+
+  if ((*value + step >= -MIC_CHIRP_CAL_LIMIT_US) && (*value + step <= MIC_CHIRP_CAL_LIMIT_US))
+  {
+    *value += step;
+    disp_cal_dirty = 1u;
+  }
 }
 
 static void disp_temp_option_rect(uint8_t i, int32_t *x0, int32_t *y0,
@@ -360,10 +447,23 @@ static void disp_touch_poll(void)
 
   if (disp_temp_menu == DISP_TEMP_CLOSED)
   {
-    if ((x >= 12u) && (x <= 195u) && (y >= 3u) && (y <= 32u))
+    if ((y >= 3u) && (y <= 32u))
     {
-      disp_temp_menu = DISP_TEMP_MODE;
+      if ((x >= DISP_CAL_X0) && (x <= DISP_CAL_X1))
+      {
+        mic_chirp_cal_get(&disp_cal_draft);
+        disp_temp_menu = DISP_CHIRP_CAL;
+      }
+      else if ((x >= 12u) && (x <= DISP_TEMP_X1))
+      {
+        disp_temp_menu = DISP_TEMP_MODE;
+      }
     }
+    return;
+  }
+  if (disp_temp_menu == DISP_CHIRP_CAL)
+  {
+    disp_cal_touch(x, y);
     return;
   }
   if ((x >= 345u) && (x <= 414u) && (y >= 99u) && (y <= 128u))
@@ -471,6 +571,8 @@ static void disp_draw_base(void)
   disp_fill(10, 205, 469, 268, C_PANEL);
   (void)disp_str(20, 211, "LAST 10", C_DIM, 1);
   disp_temp_button();
+  disp_fill(DISP_CAL_X0, 3, DISP_CAL_X1, 32, C_GRID);
+  (void)disp_str(DISP_CAL_X0 + 5, 10, "CAL", C_TEXT, 1);
 }
 
 /* 只对变化的读数局部清底并重画；收敛提示可独立更新。 */
@@ -584,6 +686,7 @@ static void disp_render(void)
   }
   if (acoustic_changed == 0u)
   {
+    if ((disp_temp_menu == DISP_CHIRP_CAL) && (disp_cal_dirty != 0u)) { disp_cal_popup(); }
     last_conv_ok = conv_ok;
     last_conv_ms = conv_ms;
     return;
@@ -691,7 +794,8 @@ static void disp_render(void)
   (void)disp_str(343, 211, b, (nth >= 2u && dj_us >= MIC_TDOA_GOOD_US) ? C_WARN : C_ACC, 1);
   disp_history(hist, nth);
 
-  if (disp_temp_menu != 0u) { disp_temp_popup(); }
+  if (disp_temp_menu == DISP_CHIRP_CAL) { disp_cal_popup(); }
+  else if (disp_temp_menu != DISP_TEMP_CLOSED) { disp_temp_popup(); }
 
   drawn = 1u;
   last_speed = speed;

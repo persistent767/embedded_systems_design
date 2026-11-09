@@ -18,6 +18,19 @@ extern "C" {
 #define MIC_EVENT_CHIRP 1u
 #define MIC_EVENT_CLAP  2u
 
+/* Both screens express the signed bias in the A-minus-B convention. */
+#define MIC_CHIRP_CAL_LIMIT_US 100
+
+typedef struct
+{
+  int32_t ab_bias_us;
+  int32_t range_bias_us;
+} mic_chirp_cal_t;
+
+void mic_chirp_cal_get(mic_chirp_cal_t *cal);
+void mic_chirp_cal_apply(const mic_chirp_cal_t *cal);
+void lt_chirp_cal_set(const mic_chirp_cal_t *cal);
+
 extern volatile uint8_t mic_event_kind;
 extern volatile uint8_t mic_tdoa_kind;
 
