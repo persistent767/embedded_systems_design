@@ -545,11 +545,10 @@ static uint8_t mic_chirp_match(uint32_t *pos256_out, float *r_out, uint32_t n,
 #define MIC_TDOA_NEW_US     60u  /* 新位置连续候选的相互容差，约 2.1 cm */
 #define MIC_TDOA_NEW_COUNT   3u  /* 连续 3 次才切换位置，单次反射不污染历史 */
 
-/* 202.7 cm calibration with the source outside each end of the baseline.
-   A-side mean: 201.94 cm at 21.7 C; B-side mean: 201.55 cm at 21.4 C.
+/* Default CHIRP biases. L is local-minus-peer; the CAL menu uses A-minus-B.
    Remove the signed local bias, then subtract the range bias from the magnitude. */
-#define MIC_CHIRP_LOCAL_BIAS_US (-3)
-#define MIC_CHIRP_RANGE_BIAS_US (-9)
+#define MIC_CHIRP_LOCAL_BIAS_US (-12)
+#define MIC_CHIRP_RANGE_BIAS_US (30)
 #define MIC_CHIRP_LOCAL_SIGN (-1)
 
 static mic_chirp_cal_t mic_chirp_cal = {
